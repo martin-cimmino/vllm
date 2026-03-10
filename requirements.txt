@@ -1,0 +1,8 @@
+transformers>=4.45
+lighteval[math]
+pandas
+matplotlib
+seaborn
+tqdm
+jsonlines
+pyyaml
