@@ -68,6 +68,7 @@ from vllm.v1.engine.utils import (
 from vllm.v1.executor import Executor
 from vllm.v1.kv_cache_interface import KVCacheConfig
 from vllm.v1.metrics.stats import SchedulerStats
+from vllm.v1.engine.smc_controller import SMCController, ResampleAction, ZombieClone
 from vllm.v1.outputs import ModelRunnerOutput
 from vllm.v1.request import Request, RequestStatus
 from vllm.v1.serial_utils import MsgpackDecoder, MsgpackEncoder
@@ -154,6 +155,24 @@ class EngineCore:
             block_size=scheduler_block_size,
         )
         self.use_spec_decode = vllm_config.speculative_config is not None
+        self.smc_controller = SMCController()
+        # Set of replacement particle IDs whose first output hasn't fired yet.
+        # smc_detokenizer_reset should only be set on the FIRST output from each
+        # replacement particle (to flush the loser's accumulated tokens), not on
+        # every subsequent output.
+        self._smc_new_particle_ids: set[str] = set()
+        # Maps new particle ID → (winner's full token sequence, original prompt len).
+        # The full sequence re-seeds the detokenizer DecodeStream; the prompt len
+        # tells the detokenizer where the winner's generated tokens start, so it
+        # can pre-populate output_token_ids with winner_gen + continuation.
+        self._smc_new_particle_tokens: dict[str, tuple[list[int], int]] = {}
+        # Given rid formatted as "{index}_{parent_id}", where index is the integer index of 
+        # the child and parent_id is the request ID of the parent.
+        # Persistent token snapshot: rid → all_token_ids from the last step the
+        # particle was active. Enables zombie_token_ids population for particles
+        # that finish one step before maybe_resample detects them as absent.
+        self._smc_token_snapshot: dict[str, list[int]] = {}
+
         if self.scheduler.connector is not None:  # type: ignore
             self.model_executor.init_kv_output_aggregator(self.scheduler.connector)  # type: ignore
 
@@ -324,6 +343,182 @@ class EngineCore:
 
         self.scheduler.add_request(request)
 
+    def _smc_auto_register_from_weights(
+        self, smc_log_weights: dict[str, float]
+    ) -> None:
+        """Register SMC groups lazily on the first step they appear.
+
+        Child request IDs follow the pattern "{index}_{parent_id}" set by
+        ParallelSamplingProcessor. We cannot rely on sp.n from child requests
+        because child sampling params always have n=1; instead we discover
+        the group size from how many children with the same parent_id are
+        present in the live batch.
+
+        Called once per step before accumulate(), only registers groups that
+        are not yet known to the controller.
+        """
+        # Collect children by parent_id.
+        by_parent: dict[str, list[str]] = {}
+        for req_id in smc_log_weights:
+            parts = req_id.split("_", 1)
+            if len(parts) != 2:
+                continue
+            try:
+                int(parts[0])
+            except ValueError:
+                continue
+            parent_id = parts[1]
+            by_parent.setdefault(parent_id, []).append(req_id)
+
+        for parent_id, child_ids in by_parent.items():
+            if parent_id in self.smc_controller._groups:
+                continue  # already registered
+
+            # Sort children by their integer index so weights align correctly.
+            child_ids_sorted = sorted(
+                child_ids, key=lambda x: int(x.split("_", 1)[0])
+            )
+
+            # Read sampling params and prompt length from any child request.
+            req = self.scheduler.requests.get(child_ids_sorted[0])
+            if req is None or req.sampling_params is None:
+                continue
+            sp = req.sampling_params
+            if sp.smc_alpha is None:
+                continue
+
+            self.smc_controller.register_group(
+                parent_request_id=parent_id,
+                child_request_ids=child_ids_sorted,
+                alpha=sp.smc_alpha,
+                ess_threshold=sp.smc_ess_threshold,
+                alpha_ramp_tokens=sp.smc_alpha_ramp_tokens,
+                original_max_tokens=req.max_tokens,
+                original_prompt_len=req.num_prompt_tokens,
+            )
+
+    def _apply_resample_actions(
+        self,
+        resample_actions: dict[str, ResampleAction],
+    ) -> None:
+        """Abort active losers, create new requests from active winners,
+        and register zombie clones (finished particles copied from zombies)."""
+        for parent_id, action in resample_actions.items():
+            # 1. Abort active losers (zombie-loser slots have no live request).
+            if action.loser_request_ids:
+                self.abort_requests(action.loser_request_ids)
+                # Clean up snapshot entries for aborted particles.
+                for rid in action.loser_request_ids:
+                    self._smc_token_snapshot.pop(rid, None)
+
+            # 2. Zombie clones: controller tracking already updated in
+            # maybe_resample (child_request_ids, zombie_token_ids, _id_to_original).
+            # No new vLLM request needed; no detokenizer reset.
+            #_ = action.zombie_clones  # acknowledged; nothing to do at engine level
+
+            # 3. Create new requests for resampled slots
+            for particle in action.new_particles:
+                # Find ancestor request to clone sampling params
+                ancestor = self.scheduler.requests.get(
+                    particle.ancestor_request_id
+                )
+                if ancestor is None or ancestor.sampling_params is None:
+                    #print(
+                    #    f"[SMC_DBG] SKIP particle={particle.new_request_id} "
+                    #    f"reason=ancestor_not_found "
+                    #    f"anc_id={particle.ancestor_request_id} "
+                    #    f"in_sched={particle.ancestor_request_id in self.scheduler.requests}",
+                    #    flush=True,
+                    #)
+                    continue
+
+                # Clone sampling params and adjust max_tokens.
+                # Use ancestor.sampling_params.max_tokens (the winner's
+                # already-adjusted remaining budget from its own creation)
+                # rather than particle.original_max_tokens (the original
+                # user-specified value). After a chain of resamplings, the
+                # winner's max_tokens has been reduced at each event;
+                # ignoring those reductions would reset the budget to the
+                # original value and allow particles to exceed max_new_tokens.
+                new_sp = ancestor.sampling_params.clone()
+                remaining = (
+                    ancestor.sampling_params.max_tokens
+                    - particle.num_output_tokens
+                )
+                if remaining <= 0:
+                    #print(
+                    #    f"[SMC_DBG] SKIP particle={particle.new_request_id} "
+                    #    f"reason=budget_exhausted "
+                    #    f"anc_max_tokens={ancestor.sampling_params.max_tokens} "
+                    #    f"num_output={particle.num_output_tokens}",
+                    #    flush=True,
+                    #)
+                    continue
+                new_sp.max_tokens = remaining
+
+                #print(
+                #    f"[SMC_DBG] CREATE particle={particle.new_request_id} "
+                #    f"slot={particle.slot_index} "
+                #    f"anc={particle.ancestor_request_id} "
+                #    f"anc_max_tokens={ancestor.sampling_params.max_tokens} "
+                #    f"anc_output_tokens={particle.num_output_tokens} "
+                #    f"remaining={remaining} "
+                #    f"prompt_len={len(particle.token_ids)}",
+                #    flush=True,
+                #)
+                new_request = Request(
+                    request_id=particle.new_request_id,
+                    prompt_token_ids=particle.token_ids,
+                    sampling_params=new_sp,
+                    pooling_params=None,
+                    arrival_time=time.time(),
+                    block_hasher=self.request_block_hasher,
+                )
+                # Add directly to scheduler (skip _smc_maybe_register
+                # since the controller already updated child_request_ids).
+                self.scheduler.add_request(new_request)
+                # Mark this ID as needing a detokenizer reset on its first output.
+                self._smc_new_particle_ids.add(particle.new_request_id)
+                # Store (full token sequence, original prompt len) for detokenizer
+                # reset: the full sequence re-seeds DecodeStream context; the prompt
+                # len splits winner_gen from continuation so output_token_ids is
+                # winner_gen + continuation (not just continuation).
+                group = self.smc_controller._groups.get(parent_id)
+                orig_prompt_len = group.original_prompt_len if group else 0
+                self._smc_new_particle_tokens[particle.new_request_id] = (
+                    particle.token_ids, orig_prompt_len
+                )
+
+    def _smc_remap_outputs(
+        self,
+        engine_core_outputs: dict[int, "EngineCoreOutputs"],
+    ) -> None:
+        """Rewrite internal SMC request IDs to original external-facing IDs.
+
+        Also sets smc_detokenizer_reset=True so the output processor knows
+        to reset detokenizer state for remapped outputs.
+        """
+        if not self.smc_controller._id_to_original:
+            return
+        for outputs in engine_core_outputs.values():
+            for output in outputs.outputs:
+                internal_id = output.request_id
+                original = self.smc_controller._id_to_original.get(internal_id)
+                if original is not None:
+                    output.request_id = original
+                    # Only reset the detokenizer on the first output from this
+                    # replacement particle (to flush the loser's accumulated
+                    # tokens). Subsequent outputs from the same particle must
+                    # NOT reset — otherwise the detokenizer is cleared every
+                    # step and only the last token survives.
+                    if internal_id in self._smc_new_particle_ids:
+                        output.smc_detokenizer_reset = True
+                        self._smc_new_particle_ids.discard(internal_id)
+                        token_info = self._smc_new_particle_tokens.pop(internal_id, None)
+                        if token_info is not None:
+                            output.smc_winner_token_ids = token_info[0]
+                            output.smc_winner_prompt_len = token_info[1]
+
     def abort_requests(self, request_ids: list[str]):
         """Abort requests from the scheduler."""
 
@@ -400,12 +595,39 @@ class EngineCore:
             if model_output is None:
                 model_output = self.model_executor.sample_tokens(grammar_output)
 
+        # SMC hook: accumulate weights and maybe resample
+        if model_output is not None and model_output.smc_log_weights:
+            self._smc_auto_register_from_weights(model_output.smc_log_weights)
+            self.smc_controller.accumulate(model_output.smc_log_weights)
+            # Update token snapshot for all active SMC particles.
+            # Particles that finish THIS step are still in scheduler.requests
+            # (update_from_output hasn't run yet), so their tokens are captured
+            # here and available next step when they're detected as zombies.
+            for grp in self.smc_controller._groups.values():
+                for rid in grp.child_request_ids:
+                    req = self.scheduler.requests.get(rid)
+                    if req is not None:
+                        # Update snapshot with current tokens for this request ID. 
+                        # We ensure the engine ensures that the SMC resampling 
+                        # process has access to the most up-to-date information about each particle's progress.
+                        self._smc_token_snapshot[rid] = list(req.all_token_ids)  # type: ignore[union-attr]
+            resample_actions = self.smc_controller.maybe_resample(
+                self.scheduler.requests, self._smc_token_snapshot
+            )
+            if resample_actions:
+                self._apply_resample_actions(resample_actions)
+
         # Before processing the model output, process any aborts that happened
         # during the model execution.
         self._process_aborts_queue()
         engine_core_outputs = self.scheduler.update_from_output(
             scheduler_output, model_output
         )
+
+        # SMC output ID remapping: rewrite internal SMC IDs to original
+        # external-facing child IDs so the OutputProcessor can find them.
+        if engine_core_outputs:
+            self._smc_remap_outputs(engine_core_outputs)
 
         return engine_core_outputs, scheduler_output.total_num_scheduled_tokens > 0
 
@@ -503,12 +725,32 @@ class EngineCore:
                 exec_model_fut.result()
                 raise RuntimeError("unexpected error")
 
+        # SMC hook: accumulate weights and maybe resample
+        if model_output is not None and model_output.smc_log_weights:
+            self._smc_auto_register_from_weights(model_output.smc_log_weights)
+            self.smc_controller.accumulate(model_output.smc_log_weights)
+            # Update token snapshot for all active SMC particles.
+            for grp in self.smc_controller._groups.values():
+                for rid in grp.child_request_ids:
+                    req = self.scheduler.requests.get(rid)
+                    if req is not None:
+                        self._smc_token_snapshot[rid] = list(req.all_token_ids)  # type: ignore[union-attr]
+            resample_actions = self.smc_controller.maybe_resample(
+                self.scheduler.requests, self._smc_token_snapshot
+            )
+            if resample_actions:
+                self._apply_resample_actions(resample_actions)
+
         # Before processing the model output, process any aborts that happened
         # during the model execution.
         self._process_aborts_queue()
         engine_core_outputs = self.scheduler.update_from_output(
             scheduler_output, model_output
         )
+
+        # SMC output ID remapping
+        if engine_core_outputs:
+            self._smc_remap_outputs(engine_core_outputs)
 
         # NOTE(nick): We can either handle the deferred tasks here or save
         # in a field and do it immediately once step_with_batch_queue is

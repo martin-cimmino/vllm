@@ -177,6 +177,17 @@ class EngineCoreOutput(
     # The number of NaNs in logits.
     # A value greater than 0 indicates that the output is corrupted.
     num_nans_in_logits: int = 0
+    smc_log_weight: float | None = None
+    smc_detokenizer_reset: bool = False
+    # Winner's full token sequence (prompt + generated) to re-seed the
+    # detokenizer DecodeStream after resampling, so the replacement
+    # particle's first continuation token decodes without context errors.
+    smc_winner_token_ids: list[int] | None = None
+    # Length of the original prompt (before SMC child tokens were appended).
+    # Used to split winner_token_ids into prompt vs generated parts so the
+    # detokenizer can pre-populate output_token_ids with the winner's
+    # generated tokens (not just the new continuation).
+    smc_winner_prompt_len: int | None = None
 
     @property
     def finished(self) -> bool:

@@ -42,3 +42,10 @@ class SamplingMetadata:
 
     # Speculative token ids
     spec_token_ids: list[list[int]] | None = None
+
+    # Per-request SMC alpha values (0.0 means SMC disabled for that request).
+    smc_alphas: torch.Tensor | None = None
+    # Per-request α ramp durations (0 means no ramp, i.e. full α from step 0).
+    smc_alpha_ramp_tokens: torch.Tensor | None = None
+    # Per-request decode step counts (for α ramp computation).
+    smc_step_counts: torch.Tensor | None = None

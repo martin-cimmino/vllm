@@ -291,6 +291,14 @@ class SamplingParams(
     '\\emoji \\emoji \\emoji ...'). This feature can detect such behavior
     and terminate early, saving time and tokens."""
 
+    # SMC fields (Power-SMC sampling, active when smc_alpha is set and n > 1)
+    smc_alpha: float | None = None
+    """Power exponent α > 1 for SMC resampling; None = disabled."""
+    smc_ess_threshold: float = 0.5
+    """Resample when ESS < κ·N (must be in (0, 1])."""
+    smc_alpha_ramp_tokens: int = 0
+    """Linear ramp from 1→α over first N tokens (0 = no ramp)."""
+
     @staticmethod
     def from_optional(
         n: int | None = 1,
@@ -399,6 +407,9 @@ class SamplingParams(
         if self.stop and not self.include_stop_str_in_output:
             self.output_text_buffer_length = max(len(s) for s in self.stop) - 1
 
+        if self.smc_alpha is not None and self.temperature == 1.0:
+            self.temperature = 1.0 / self.smc_alpha
+
         self._verify_args()
 
         if self.temperature < _SAMPLING_EPS:
@@ -503,6 +514,14 @@ class SamplingParams(
                 "stop strings are only supported when detokenize is True. "
                 "Set detokenize=True to use stop."
             )
+        if self.smc_alpha is not None:
+            if self.smc_alpha <= 1.0:
+                raise ValueError("smc_alpha must be > 1.0")
+            if not (0.0 < self.smc_ess_threshold < 1.0):
+                raise ValueError("smc_ess_threshold must be in (0, 1) exclusive")
+            # Note: n==1 is valid for child/resampled requests (each child has
+            # n=1 but carries smc_alpha for weight computation). Only enforce
+            # n>1 for the original parent request at the API boundary.
 
     def _verify_greedy_sampling(self) -> None:
         if self.n > 1:

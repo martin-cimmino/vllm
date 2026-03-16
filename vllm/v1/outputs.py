@@ -119,6 +119,7 @@ class SamplerOutput:
     # PLACEHOLDER_TOKEN_ID (-1 by default) is used for padding.
     sampled_token_ids: torch.Tensor
     logprobs_tensors: LogprobsTensors | None
+    smc_log_weights: torch.Tensor | None = None  # [num_reqs], float32
 
 
 T = TypeVar("T")
@@ -246,6 +247,9 @@ class ModelRunnerOutput:
 
     # information related to cudagraph execution
     cudagraph_stats: CUDAGraphStat | None = None
+
+    # req_id → incremental SMC log-weight for this step
+    smc_log_weights: dict[str, float] | None = None
 
 
 # ModelRunnerOutput wrapper for async scheduling.

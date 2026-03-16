@@ -4009,6 +4009,18 @@ class GPUModelRunner(
                 else:
                     logger.error("RoutedExpertsCapturer not initialized.")
 
+            # Convert SMC log-weights tensor to dict indexed by req_id
+            smc_log_weights_dict: dict[str, float] | None = None
+            if (
+                sampler_output is not None
+                and sampler_output.smc_log_weights is not None
+            ):
+                w = sampler_output.smc_log_weights.tolist()
+                smc_log_weights_dict = {
+                    req_ids_output_copy[i]: w[i]
+                    for i in range(len(req_ids_output_copy))
+                }
+
             output = ModelRunnerOutput(
                 req_ids=req_ids_output_copy,
                 req_id_to_index=req_id_to_index_output_copy,
@@ -4021,6 +4033,7 @@ class GPUModelRunner(
                 else None,
                 num_nans_in_logits=num_nans_in_logits,
                 cudagraph_stats=cudagraph_stats,
+                smc_log_weights=smc_log_weights_dict,
             )
 
         if not self.use_async_scheduling:

@@ -211,6 +211,17 @@ class InputBatch:
         self.repetition_penalties_cpu = self.repetition_penalties_cpu_tensor.numpy()
         self.repetition_penalties_reqs: set[str] = set()
 
+        # SMC alpha values per request (0.0 = SMC disabled)
+        self.smc_alpha = torch.zeros(
+            (max_num_reqs,), dtype=torch.float32, device=device
+        )
+        self.smc_alpha_cpu_tensor = torch.zeros(
+            (max_num_reqs,), dtype=torch.float32, device="cpu", pin_memory=pin_memory
+        )
+        self.smc_alpha_cpu = self.smc_alpha_cpu_tensor.numpy()
+        self.smc_alpha_ramp_cpu: np.ndarray = np.zeros(max_num_reqs, dtype=np.int32)
+        self.smc_reqs: set[str] = set()
+
         # Speculative decoding
         self.num_accepted_tokens_cpu_tensor = torch.ones(
             (max_num_reqs,), dtype=torch.int64, device="cpu", pin_memory=pin_memory
@@ -377,6 +388,17 @@ class InputBatch:
             if sampling_params.repetition_penalty != 1.0:
                 self.repetition_penalties_reqs.add(req_id)
 
+            self.smc_alpha_cpu[req_index] = (
+                sampling_params.smc_alpha if sampling_params.smc_alpha is not None else 0.0
+            )
+            self.smc_alpha_ramp_cpu[req_index] = (
+                sampling_params.smc_alpha_ramp_tokens
+                if sampling_params.smc_alpha_ramp_tokens
+                else 0
+            )
+            if sampling_params.smc_alpha is not None:
+                self.smc_reqs.add(req_id)
+
             # NOTE(woosuk): self.generators should not include the requests that
             # do not have their own generator.
             if request.generator is not None:
@@ -513,6 +535,7 @@ class InputBatch:
         self.frequency_penalties_reqs.discard(req_id)
         self.presence_penalties_reqs.discard(req_id)
         self.repetition_penalties_reqs.discard(req_id)
+        self.smc_reqs.discard(req_id)
         self.generators.pop(req_index, None)
         self.num_logprobs.pop(req_id, None)
         self.in_progress_prompt_logprobs_cpu.pop(req_id, None)
@@ -841,6 +864,28 @@ class InputBatch:
             )
             allowed_token_ids_mask = self.allowed_token_ids_mask[:num_reqs]
 
+        # Copy SMC alpha values if any requests use SMC
+        if self.smc_reqs:
+            copy_slice(self.smc_alpha_cpu_tensor, self.smc_alpha, num_reqs)
+            smc_alphas = self.smc_alpha[:num_reqs]
+            # Build step count and ramp tensors for α ramp
+            smc_step_counts = torch.tensor(
+                [
+                    len(self.req_output_token_ids[i])
+                    if self.req_output_token_ids[i] is not None
+                    else 0
+                    for i in range(num_reqs)
+                ],
+                dtype=torch.int32,
+            )
+            smc_alpha_ramp_tokens = torch.from_numpy(
+                self.smc_alpha_ramp_cpu[:num_reqs].copy()
+            )
+        else:
+            smc_alphas = None
+            smc_step_counts = None
+            smc_alpha_ramp_tokens = None
+
         return SamplingMetadata(
             temperature=temperature,
             all_greedy=self.all_greedy,
@@ -859,6 +904,9 @@ class InputBatch:
             allowed_token_ids_mask=allowed_token_ids_mask,
             bad_words_token_ids=self.bad_words_token_ids,
             logitsprocs=self.logitsprocs,
+            smc_alphas=smc_alphas,
+            smc_alpha_ramp_tokens=smc_alpha_ramp_tokens,
+            smc_step_counts=smc_step_counts,
         )
 
     def get_pooling_params(self) -> list[PoolingParams]:

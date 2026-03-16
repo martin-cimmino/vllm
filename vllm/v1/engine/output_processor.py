@@ -274,6 +274,7 @@ class RequestState:
         stop_reason: int | str | None,
         kv_transfer_params: dict[str, Any] | None = None,
         routed_experts: np.ndarray | None = None,
+        smc_log_weight: float | None = None,
     ) -> RequestOutput | PoolingRequestOutput | None:
         finished = finish_reason is not None
         final_only = self.output_kind == RequestOutputKind.FINAL_ONLY
@@ -315,7 +316,7 @@ class RequestState:
             )
 
         output = self._new_completion_output(
-            new_token_ids, finish_reason, stop_reason, routed_experts
+            new_token_ids, finish_reason, stop_reason, routed_experts, smc_log_weight
         )
 
         if self.parent_req is None:
@@ -379,6 +380,7 @@ class RequestState:
         finish_reason: FinishReason | None,
         stop_reason: int | str | None,
         routed_experts: np.ndarray | None = None,
+        smc_log_weight: float | None = None,
     ) -> CompletionOutput:
         assert self.detokenizer is not None
         assert self.logprobs_processor is not None
@@ -404,6 +406,7 @@ class RequestState:
             cumulative_logprob=self.logprobs_processor.cumulative_logprob,
             finish_reason=str(finish_reason) if finished else None,
             stop_reason=stop_reason if finished else None,
+            smc_log_weight=smc_log_weight,
         )
 
     def _new_pooling_output(self, pooling_output: torch.Tensor) -> PoolingOutput:
@@ -617,8 +620,31 @@ class OutputProcessor:
             stop_reason = engine_core_output.stop_reason
             kv_transfer_params = engine_core_output.kv_transfer_params
             routed_experts = engine_core_output.routed_experts
+            smc_log_weight = engine_core_output.smc_log_weight
             req_state.num_cached_tokens = engine_core_output.num_cached_tokens
             req_state.is_prefilling = False
+
+            # SMC detokenizer reset: clear accumulated loser tokens
+            # so the winner's continuation is detokenized cleanly.
+            # Only meaningful in FINAL_ONLY mode (no streaming).
+            if engine_core_output.smc_detokenizer_reset:
+                if req_state.detokenizer is not None:
+                    _before = len(req_state.detokenizer.token_ids)
+                    # This reset is triggered when maybe_resample detects that the winner 
+                    # has advanced and the current particle is a loser, so we can be confident 
+                    #that the winner's token ids are correct and up-to-date for resetting the detokenizer.
+                    req_state.detokenizer.reset_for_smc(
+                        engine_core_output.smc_winner_token_ids,
+                        engine_core_output.smc_winner_prompt_len or 0,
+                    )
+                    #print(
+                    #    f"[SMC_DBG] RESET req={req_id} "
+                    #    f"before_tokens={_before} "
+                    #    f"winner_len={len(engine_core_output.smc_winner_token_ids) if engine_core_output.smc_winner_token_ids else 0} "
+                    #    f"winner_prompt_len={engine_core_output.smc_winner_prompt_len} "
+                    #    f"num_cached_tokens={engine_core_output.num_cached_tokens}",
+                    #    flush=True,
+                    #)
 
             if pooling_output is None:
                 assert req_state.detokenizer is not None
@@ -643,6 +669,7 @@ class OutputProcessor:
                 stop_reason,
                 kv_transfer_params,
                 routed_experts,
+                smc_log_weight,
             ):
                 if req_state.streaming_input:
                     request_output.finished = False
@@ -656,6 +683,14 @@ class OutputProcessor:
 
             # Free completed requests.
             if finish_reason is not None:
+                #if req_state.detokenizer is not None:
+                    #print(
+                    #    f"[SMC_DBG] FINISH req={req_id} "
+                    #    f"token_ids_len={len(req_state.detokenizer.token_ids)} "
+                    #    f"output_token_ids_len={len(req_state.detokenizer.output_token_ids)} "
+                    #    f"finish={finish_reason}",
+                    #    flush=True,
+                    #)
                 if req_state.streaming_input:
                     if req_state.input_chunk_queue:
                         update = req_state.input_chunk_queue.popleft()

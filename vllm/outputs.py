@@ -46,6 +46,7 @@ class CompletionOutput:
     finish_reason: str | None = None
     stop_reason: int | str | None = None
     lora_request: LoRARequest | None = None
+    smc_log_weight: float | None = None
 
     def finished(self) -> bool:
         return self.finish_reason is not None

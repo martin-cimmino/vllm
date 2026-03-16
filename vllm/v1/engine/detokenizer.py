@@ -45,6 +45,28 @@ class IncrementalDetokenizer:
     def get_next_output_text(self, finished: bool, delta: bool) -> str:
         return ""
 
+    def reset_for_smc(
+        self,
+        winner_token_ids: list[int] | None = None,
+        original_prompt_len: int = 0,
+    ) -> None:
+        """Reset output state after SMC resampling (loser → winner replacement).
+
+        Clears accumulated tokens so the replacement particle's continuation
+        is detokenized cleanly. Subclasses must also reset any incremental
+        decode state (stream, offsets) to avoid spurious warnings.
+
+        Args:
+            winner_token_ids: winner's full token sequence (prompt + generated).
+                Passed to subclasses so they can re-seed decode context and
+                avoid "invalid prefix" errors on the first continuation token.
+            original_prompt_len: number of prompt tokens in winner_token_ids.
+                Subclasses use this to pre-populate output_token_ids with
+                winner_token_ids[original_prompt_len:] so the final completion
+                contains winner_generated + continuation (not just continuation).
+        """
+        self.token_ids.clear()
+
     @classmethod
     def from_new_request(
         cls,
@@ -93,6 +115,15 @@ class BaseIncrementalDetokenizer(IncrementalDetokenizer, ABC):
 
         # Generation data
         self.output_text = ""
+
+    def reset_for_smc(
+        self,
+        winner_token_ids: list[int] | None = None,
+        original_prompt_len: int = 0,
+    ) -> None:
+        self.token_ids.clear()
+        self.output_text = ""
+        self._last_output_text_offset = 0
 
     def update(self, new_token_ids: list[int], stop_terminated: bool) -> str | None:
         """
@@ -205,6 +236,29 @@ class FastIncrementalDetokenizer(BaseIncrementalDetokenizer):
             else:
                 # No added tokens.
                 self.spaces_between_special_tokens = True
+
+    def reset_for_smc(
+        self,
+        winner_token_ids: list[int] | None = None,
+        original_prompt_len: int = 0,
+    ) -> None:
+        super().reset_for_smc(winner_token_ids, original_prompt_len)
+        # Re-seed the DecodeStream and pre-populate output with winner's
+        # generated tokens so the final completion contains
+        # winner_generated + continuation (not just continuation).
+        if winner_token_ids:
+            prompt_tokens = winner_token_ids[:original_prompt_len]
+            winner_gen_tokens = winner_token_ids[original_prompt_len:]
+            # Seed stream with prompt-only context, then replay generated tokens.
+            self.stream = DecodeStream(
+                ids=prompt_tokens,
+                skip_special_tokens=self.skip_special_tokens,
+            )
+            for token_id in winner_gen_tokens:
+                self.token_ids.append(token_id)
+                self.output_text += self.decode_next(token_id)
+        else:
+            self.stream = DecodeStream(skip_special_tokens=self.skip_special_tokens)
 
     def decode_next(self, next_token_id: int) -> str:
         token = self._protected_step(next_token_id)

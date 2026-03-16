@@ -89,6 +89,9 @@ class Sampler(nn.Module):
         # Use float32 for the logits.
         logits = logits.to(torch.float32)
 
+        # Compute SMC incremental log-weights (on raw float32 logits, before penalties)
+        smc_log_weights = self._compute_smc_weights(logits, sampling_metadata)
+
         logits = self.apply_logits_processors(
             logits, sampling_metadata, predict_bonus_token
         )
@@ -125,6 +128,7 @@ class Sampler(nn.Module):
             # token per request.
             sampled_token_ids=sampled.unsqueeze(-1),
             logprobs_tensors=logprobs_tensors,
+            smc_log_weights=smc_log_weights,
         )
         return sampler_output
 
@@ -205,6 +209,41 @@ class Sampler(nn.Module):
     @staticmethod
     def compute_logprobs(logits: torch.Tensor) -> torch.Tensor:
         return logits.log_softmax(dim=-1, dtype=torch.float32)
+
+    @staticmethod
+    def _compute_smc_weights(
+        logits: torch.Tensor,
+        sampling_metadata: SamplingMetadata,
+    ) -> torch.Tensor | None:
+        """Compute incremental SMC log-weight per request.
+
+        log_w_t = logsumexp(α · log_softmax(logits), dim=-1) for SMC requests,
+        0.0 for non-SMC requests.
+        Returns None if no request has SMC enabled.
+        """
+        smc_alphas = sampling_metadata.smc_alphas
+        if smc_alphas is None:
+            return None
+        # smc_alphas is a CPU tensor; move to same device as logits
+        alpha_t = smc_alphas.to(device=logits.device, dtype=torch.float32)
+        # Apply α ramp: alpha_eff = min(alpha, 1.0 + (alpha-1.0) * step/ramp_tokens)
+        if (sampling_metadata.smc_alpha_ramp_tokens is not None
+                and sampling_metadata.smc_step_counts is not None):
+            ramp = sampling_metadata.smc_alpha_ramp_tokens.to(
+                device=logits.device, dtype=torch.float32
+            )
+            steps = sampling_metadata.smc_step_counts.to(
+                device=logits.device, dtype=torch.float32
+            )
+            ramp_mask = ramp > 0
+            ramped = 1.0 + (alpha_t - 1.0) * (steps + 1.0) / ramp.clamp(min=1.0)
+            alpha_t = torch.where(ramp_mask, torch.minimum(alpha_t, ramped), alpha_t)
+        log_p = logits.log_softmax(dim=-1)  # [num_reqs, vocab]
+        # α · log_p, then logsumexp over vocab → scalar per request
+        log_w = torch.logsumexp(alpha_t.unsqueeze(1) * log_p, dim=-1)  # [num_reqs]
+        # Zero out non-SMC requests
+        log_w = log_w * (alpha_t > 0).float()
+        return log_w
 
     @staticmethod
     def gather_logprobs(
