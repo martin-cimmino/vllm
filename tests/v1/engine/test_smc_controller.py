@@ -12,6 +12,7 @@ CompletionResponseChoice — no model loading required.
 """
 from __future__ import annotations
 
+import random
 from dataclasses import fields as dataclass_fields
 from types import SimpleNamespace
 
@@ -89,7 +90,6 @@ def test_ess_degenerate(n: int) -> None:
     assert abs(ess - expected) < 1e-4, (
         f"n={n}: expected ESS≈{expected:.4f}, got {ess:.4f}"
     )
-
 
 def test_systematic_resample_uniform() -> None:
     """Uniform weights → ancestors are a permutation of [0, N-1]."""
@@ -170,6 +170,74 @@ def test_unregister_group_removes_entry() -> None:
 
 
 # ─── Phase 2: ResampleAction construction ────────────────────────────────────
+
+
+# active list : [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15]
+# anc_pos:      [1, 1, 1, 1, 1, 4, 5, 6, 7, 8,  9, 10, 11, 12, 13, 14]
+
+def test_maybe_resample_losers_identified_correctly() -> None:
+    """ResampleAction.loser_request_ids correctly identifies losers based on ESS.
+
+    With seed=42 and these 16-particle weights, ESS ≈ 0.499 < 0.5 → fires.
+    anc_pos = [0, 0, 2, 3, 3, 3, 3, 4, 6, 7, 8, 9, 10, 12, 13, 15]
+    True winners (self-mapped): slots 0, 2, 3, 15.
+    Proxy ancestors (direct, not resolved): slots 4, 6, 7, 8, 9, 10, 12, 13.
+    The abort-after-create fix in core.py ensures proxy ancestors are still
+    alive when their token sequences are read.
+    """
+    ctrl = SMCController()
+    ctrl.register_group(
+        "p1", ["c0", "c1", "c2", "c3", "c4", "c5", "c6", "c7", "c8", "c9",
+               "c10", "c11", "c12", "c13", "c14", "c15"],
+        alpha=4.0, ess_threshold=0.5,
+        alpha_ramp_tokens=100, original_max_tokens=8192,
+    )
+    ctrl.accumulate({
+        "c0": -10.464439448678107, "c1": -12.235446452771413,
+        "c2": -11.562239008591305, "c3": -9.39429838034851,
+        "c4": -12.295605566207932, "c5": -11.807898694641466,
+        "c6": -11.060544531512818, "c7": -11.101674714510736,
+        "c8": -10.540749268157178, "c9": -11.52127701671975,
+        "c10": -10.976022033243552, "c11": -11.155199924152399,
+        "c12": -11.333260488761333, "c13": -11.167389545859358,
+        "c14": -12.292045226215656, "c15": -10.63779145808848,
+    })
+    reqs = _build_requests_dict(ctrl, "p1")
+    random.seed(42)
+    actions = ctrl.maybe_resample(reqs)
+
+    # With seed=42: anc_pos = [0,0,2,3, 3,3,3,4, 6,7,8,9, 10,12,13,15]
+    # Winners (self-mapped slots): 0, 2, 3, 15.
+    # Losers: all other 12 slots.
+    losers = {"c1", "c4", "c5", "c6", "c7", "c8", "c9", "c10",
+              "c11", "c12", "c13", "c14"}
+    # Direct ancestors for each loser (proxy ancestors allowed with abort-after-create):
+    # c1→c0, c4→c3, c5→c3, c6→c3, c7→c4, c8→c6, c9→c7,
+    # c10→c8, c11→c9, c12→c10, c13→c12, c14→c13
+    expected_ancestors = {
+        "c1": "c0",  "c4": "c3",  "c5": "c3",  "c6": "c3",
+        "c7": "c4",  "c8": "c6",  "c9": "c7",  "c10": "c8",
+        "c11": "c9", "c12": "c10", "c13": "c12", "c14": "c13",
+    }
+    # Build a slot→original_id reverse map from child_request_ids (pre-resample)
+    group = ctrl._groups["p1"]
+    # The child_request_ids are updated in-place by maybe_resample, but
+    # new_particles carry ancestor_request_id = group.child_request_ids[true_anc_slot]
+    # which still equals the original cN names for all 16 slots here.
+
+    assert "p1" in actions
+    action = actions["p1"]
+    assert set(action.loser_request_ids) == losers
+    assert len(action.new_particles) == 12
+    for particle in action.new_particles:
+        assert isinstance(particle, NewParticle)
+        # Recover the original loser ID via _id_to_original (which maps new_id→original)
+        orig_loser = ctrl.get_original_id(particle.new_request_id)
+        expected_anc = expected_ancestors[orig_loser]
+        assert particle.ancestor_request_id == expected_anc, (
+            f"loser {orig_loser}: expected ancestor {expected_anc}, "
+            f"got {particle.ancestor_request_id}"
+        )
 
 
 def test_maybe_resample_no_action_when_ess_high() -> None:
@@ -311,7 +379,8 @@ def test_freezes_finished_particle_and_resamples_active() -> None:
     """When a particle finishes, ESS is computed over ALL N weights (zombie-
     inclusive). ESS collapse is driven by zombie vs active weight divergence.
     Resampling only touches active slots — zombie slots stay as-is.
-    After resample, all weights (including former zombie) reset to 0."""
+    After resample, only active weights reset to 0; zombie log_weights are
+    preserved at their frozen value."""
     ctrl = SMCController()
     ctrl.register_group(
         "p1", ["c0", "c1", "c2", "c3"], alpha=2.0, ess_threshold=0.5,
@@ -400,42 +469,67 @@ def test_get_final_weights_returns_empty_for_unknown_group() -> None:
     assert ctrl.get_final_weights("nonexistent") == {}
 
 
-def test_active_only_ess_trigger() -> None:
-    """Resampling uses active-only ESS for the trigger.
+def test_zombie_inclusive_ess_trigger() -> None:
+    """Resampling uses zombie-inclusive (all-N) ESS for the trigger.
 
-    Equal active weights (uniform) → ESS = 1.0 → no resample, even when a
-    zombie has a better weight.  Divergent active weights → ESS < threshold
-    → resample fires.
+    Sub-test 1: zombie weight better than active weights → zombie-inclusive
+    ESS collapses below threshold → resample fires (zombie stays frozen,
+    not included in loser list).
+
+    Sub-test 2: all-N weights uniform → ESS = 1.0 → no resample.
+
+    Sub-test 3: divergent active weights → ESS < threshold → resample fires.
     """
+    # Sub-test 1: zombie has better weight (-1) than active weights (-4 each).
+    # All-N ESS over [-4,-4,-4,-1] ≈ 0.33 < 0.5 → fires.
     ctrl = SMCController()
     ctrl.register_group(
         "p1", ["c0", "c1", "c2", "c3"], alpha=2.0, ess_threshold=0.5,
         alpha_ramp_tokens=0, original_max_tokens=100,
     )
-    # c3 finishes with weight -1.0; active particles get equal small weights.
     ctrl.accumulate({"c0": -1.0, "c1": -1.0, "c2": -1.0, "c3": -1.0})
     ctrl.accumulate({"c0": -3.0, "c1": -3.0, "c2": -3.0})
-    # Active weights: -4, -4, -4 (uniform → ESS=1.0); zombie weight: -1.
-    # With active-only ESS, zombie domination does NOT trigger resampling.
+    # All-N weights: [-4, -4, -4, -1]; zombie (-1) dominates active (-4 each).
     reqs: dict[str, object] = {}
     for rid in ["c0", "c1", "c2"]:
         reqs[rid] = _make_fake_request(rid, [1, 2, 3, 100], [100])
     actions = ctrl.maybe_resample(reqs)
-    assert "p1" not in actions, "Uniform active weights should not trigger resample"
+    assert "p1" in actions, (
+        "Zombie-inclusive ESS collapse should trigger resample "
+        "(zombie weight -1 dominates active -4)"
+    )
+    # c3 is a zombie — it must NOT appear in loser_request_ids.
+    assert "c3" not in actions["p1"].loser_request_ids
 
-    # Divergent active weights DO trigger resampling.
+    # Sub-test 2: all-N weights uniform → ESS = 1.0 → no resample.
     ctrl2 = SMCController()
     ctrl2.register_group(
         "p1", ["c0", "c1", "c2", "c3"], alpha=2.0, ess_threshold=0.5,
         alpha_ramp_tokens=0, original_max_tokens=100,
     )
-    ctrl2.accumulate({"c0": 0.0, "c1": -100.0, "c2": -100.0, "c3": -1.0})
-    # c3 zombie (weight -1), active c0=0 dominates c1=-100, c2=-100.
+    # All four accumulate at -1.0; c3 finishes → frozen at -1.0; active also -1.0.
+    ctrl2.accumulate({"c0": -1.0, "c1": -1.0, "c2": -1.0, "c3": -1.0})
+    # All-N weights: [-1, -1, -1, -1] → uniform → ESS = 1.0 → no resample.
     reqs2: dict[str, object] = {}
     for rid in ["c0", "c1", "c2"]:
         reqs2[rid] = _make_fake_request(rid, [1, 2, 3, 100], [100])
     actions2 = ctrl2.maybe_resample(reqs2)
-    assert "p1" in actions2, "Divergent active weights should trigger resample"
+    assert "p1" not in actions2, "Uniform all-N weights should not trigger resample"
+
+    # Sub-test 3: divergent active weights DO trigger resample.
+    ctrl3 = SMCController()
+    ctrl3.register_group(
+        "p1", ["c0", "c1", "c2", "c3"], alpha=2.0, ess_threshold=0.5,
+        alpha_ramp_tokens=0, original_max_tokens=100,
+    )
+    ctrl3.accumulate({"c0": 0.0, "c1": -100.0, "c2": -100.0, "c3": -1.0})
+    # c3 zombie (weight -1), active c0=0 dominates c1=-100, c2=-100.
+    # All-N ESS ≈ 0.41 < 0.5 → fires.
+    reqs3: dict[str, object] = {}
+    for rid in ["c0", "c1", "c2"]:
+        reqs3[rid] = _make_fake_request(rid, [1, 2, 3, 100], [100])
+    actions3 = ctrl3.maybe_resample(reqs3)
+    assert "p1" in actions3, "Divergent active weights should trigger resample"
 
 
 def test_zombie_ancestor_does_not_win_active_slots() -> None:

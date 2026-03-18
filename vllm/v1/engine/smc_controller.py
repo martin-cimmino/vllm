@@ -170,8 +170,8 @@ class SMCController:
         they are excluded from the resampling pool.  Zombie weights contribute
         to the ESS trigger but winners are always drawn from active particles.
 
-        After resampling ALL N weights are reset to 0 (uniform). Zombie slots
-        re-freeze at 0 on the next step.
+        After resampling, active slot weights are reset to 0 (uniform). Zombie
+        frozen_weights are preserved so that get_final_weights() can use them.
 
         Args:
             requests: scheduler's requests dict (str → Request objects).
@@ -205,72 +205,32 @@ class SMCController:
                 continue  # All particles finished — nothing to resample.
 
             # Step 3: ESS over ACTIVE weights only.
-            #
-            # NOTE: zombie-inclusive ESS is NOT used here, despite the
-            # reference power_smc.py doing so.  The reason is architectural:
-            # after each resample all weights reset to 0; zombies re-freeze
-            # at 0 the next step while active particles accumulate negative
-            # incremental weights.  Zombie weights (0) always dominate active
-            # weights (negative) → zombie-inclusive ESS collapses on EVERY
-            # step → resampling fires every step → active particles are
-            # perpetually aborted before finishing → permanent hang.
-            #
-            # The reference avoids this because zombie ancestors can win slots
-            # and produce done=True clones, shrinking the active pool until
-            # done.all().  vLLM cannot replicate that (finished requests have
-            # no live KV state), so active-only ESS is the correct trigger.
             active_weights = [group.log_weights[i] for i in active_list]
-            ess = self.compute_ess(active_weights)
+            #ess = self.compute_ess(active_weights)
+            ess = self.compute_ess(group.log_weights)
+            
             if ess >= group.ess_threshold:
                 continue
 
-            #print(
-            #    f"Resampling group {pid} at step {group.step_count} "
-            #    f"(ESS={ess:.3f} < {group.ess_threshold}, "
-            #    f"active={len(active_list)}/{n})", flush=True)
-
-            # Step 4: Systematic resample over ACTIVE slots only.
+            # Step 4: Systematic resample over ACTIVE slots only as we cannot clone zombies.
             anc_pos = self.systematic_resample(active_weights)
-            # anc_pos[j] → position in active_list that is the ancestor of
-            # active_list[j].  active_list[anc_pos[j]] is the ancestor slot.
 
-            # Step 5: Identify TRUE winners (self-mapped positions in anc_pos)
-            # and resolve proxy ancestors.
-            #
-            # Systematic resampling can produce "proxy ancestors": a slot k
-            # appears in anc_pos (some position maps to k) but k itself is a
-            # loser (anc_pos[k] != k, so k maps to some other slot l).  Using
-            # k as ancestor_request_id is wrong because k will be aborted,
-            # causing the replacement to be silently skipped.  The fix is to
-            # resolve every position's ancestry chain to the nearest TRUE winner
-            # (a self-mapped position), then use only true winners as ancestors.
-            true_winner_pos: set[int] = {
-                j for j in range(len(active_list)) if anc_pos[j] == j
-            }
-
-            def _resolve(pos: int) -> int:
-                """Follow anc_pos chain until a self-mapped (true winner) pos."""
-                seen: set[int] = set()
-                while pos not in true_winner_pos:
-                    if pos in seen:
-                        break  # cycle guard (shouldn't happen with valid resample)
-                    seen.add(pos)
-                    pos = anc_pos[pos]
-                return pos
-
-            # Collect token sequences only for TRUE winner slots.
-            true_winner_slots = {active_list[j] for j in true_winner_pos}
-            winner_token_seqs: dict[int, list[int]] = {}
-            winner_output_lens: dict[int, int] = {}
-            winner_max_tokens: dict[int, int] = {}
-            for slot in true_winner_slots:
+            # Get ancestor slots (indices in child_request_ids) for each active slot.
+            ancestor_slots = {active_list[j] for j in anc_pos}
+            #print(f"active_list={active_list} anc_pos={anc_pos} ancestor_slots={ancestor_slots} -> {[active_list[j] for j in anc_pos]} winners: {[active_list[anc_pos[i]] for i in range(len(anc_pos)) if active_list[anc_pos[i]]==active_list[i]]}")
+            
+            ancestor_token_seqs: dict[int, list[int]] = {}
+            ancestor_output_lens: dict[int, int] = {}
+            ancestor_max_tokens: dict[int, int] = {}
+            for slot in ancestor_slots:
                 rid = group.child_request_ids[slot]
                 req = requests.get(rid)
                 if req is not None:
-                    winner_token_seqs[slot] = list(req.all_token_ids)  # type: ignore[union-attr]
-                    winner_output_lens[slot] = len(req._output_token_ids)  # type: ignore[union-attr]
+                    #print(f"Found active ancestor request {rid} with tokens {len(list(req.all_token_ids))}")
+                    ancestor_token_seqs[slot] = list(req.all_token_ids)  # type: ignore[union-attr]
+                    ancestor_output_lens[slot] = len(req._output_token_ids)  # type: ignore[union-attr]
                     sp = req.sampling_params  # type: ignore[union-attr]
-                    winner_max_tokens[slot] = (
+                    ancestor_max_tokens[slot] = (
                         sp.max_tokens if sp is not None
                         else group.original_max_tokens
                     )
@@ -282,10 +242,11 @@ class SMCController:
             new_child_ids: list[str] = list(group.child_request_ids)
 
             for j, slot_idx in enumerate(active_list):
-                true_anc_j = _resolve(j)
-                true_anc_slot = active_list[true_anc_j]
+                true_anc_slot = active_list[anc_pos[j]]
                 if slot_idx == true_anc_slot:
                     continue  # True winner — stays in its slot.
+
+                #print(f"j={j} slot_idx={slot_idx} anc_pos={anc_pos[j]} true_anc_slot={true_anc_slot}")
 
                 active_loser_req_ids.append(group.child_request_ids[slot_idx])
 
@@ -296,14 +257,16 @@ class SMCController:
                 self._id_to_original[new_id] = original_child
                 new_child_ids[slot_idx] = new_id
 
-                token_ids = winner_token_seqs.get(true_anc_slot, [])
-                num_output = winner_output_lens.get(true_anc_slot, 0)
-                anc_max_tokens = winner_max_tokens.get(
+                token_ids = ancestor_token_seqs.get(true_anc_slot, [])
+                num_output = ancestor_output_lens.get(true_anc_slot, 0)
+                anc_max_tokens = ancestor_max_tokens.get(
                     true_anc_slot, group.original_max_tokens
                 )
                 remaining = anc_max_tokens - num_output
                 if remaining <= 0:
+                    print(f"Ancestor slot {true_anc_slot} has no remaining tokens (max={anc_max_tokens} output={num_output}), skipping new particle")
                     continue
+                
                 new_particles.append(NewParticle(
                     new_request_id=new_id,
                     ancestor_request_id=group.child_request_ids[true_anc_slot],
@@ -313,30 +276,21 @@ class SMCController:
                     num_output_tokens=num_output,
                 ))
 
-            #print(
-            #    f"[SMC_DIAG] resample pid={pid} step={group.step_count} "
-            #    f"active={len(active_list)} losers={len(active_loser_req_ids)} "
-            #    f"new_particles={len(new_particles)} "
-            #    f"true_winners={sorted(true_winner_slots)} "
-            #    f"loser_ids={active_loser_req_ids[:4]}{'...' if len(active_loser_req_ids)>4 else ''}",
-            #    flush=True,
-            #)
-            #for i, p in enumerate(new_particles):
-                #print(
-                #    f"[SMC_DIAG]   particle[{i}] new_id={p.new_request_id} "
-                #    f"anc={p.ancestor_request_id} "
-                #    f"token_ids_len={len(p.token_ids)} "
-                #    f"num_output={p.num_output_tokens} "
-                #    f"remaining={p.original_max_tokens - p.num_output_tokens}",
-                #    flush=True,
-                #)
+            #print(f"Resampling group {pid}: {len(active_loser_req_ids)} losers")
+            #print(f"Loser request IDs: {active_loser_req_ids}")
 
             resample_actions[pid] = ResampleAction(
                 loser_request_ids=active_loser_req_ids,
                 new_particles=new_particles,
                 zombie_clones=[],
             )
+            #print("Old child IDs:", group.child_request_ids)
+            #print("New child IDs after resampling:", new_child_ids)
+
+            # update group state for new particles: replace losers with new IDs, keep winners in place.
             group.child_request_ids = new_child_ids
+
+            #breakpoint()
 
             # Step 7: Reset ACTIVE weights to 0 (uniform after resample).
             # Zombie frozen_weights are preserved — they represent accumulated

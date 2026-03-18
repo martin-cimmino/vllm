@@ -212,11 +212,11 @@ class SMCInstrumentation:
             result = instr._orig_accumulate(ctrl_self, smc_log_weights)
             group_ess: dict[str, float] = {}
             for pid, group in ctrl_self._groups.items():
-                # NOTE: we're calculating ESS on active weights only
                 active_weights = [
                     lw for i, lw in enumerate(group.log_weights) if i not in group.frozen_weights
                 ]
-                ess = ctrl_self.compute_ess(active_weights)
+                #ess = ctrl_self.compute_ess(active_weights)
+                ess = ctrl_self.compute_ess(group.log_weights)
                 group_ess[pid] = ess
             instr.steps.append({
                 "step": step_idx,

@@ -404,32 +404,21 @@ class EngineCore:
         """Abort active losers, create new requests from active winners,
         and register zombie clones (finished particles copied from zombies)."""
         for parent_id, action in resample_actions.items():
-            # 1. Abort active losers (zombie-loser slots have no live request).
-            if action.loser_request_ids:
-                self.abort_requests(action.loser_request_ids)
-                # Clean up snapshot entries for aborted particles.
-                for rid in action.loser_request_ids:
-                    self._smc_token_snapshot.pop(rid, None)
 
-            # 2. Zombie clones: controller tracking already updated in
-            # maybe_resample (child_request_ids, zombie_token_ids, _id_to_original).
-            # No new vLLM request needed; no detokenizer reset.
-            #_ = action.zombie_clones  # acknowledged; nothing to do at engine level
-
-            # 3. Create new requests for resampled slots
+            # 1. Create new requests for resampled slots
             for particle in action.new_particles:
                 # Find ancestor request to clone sampling params
                 ancestor = self.scheduler.requests.get(
                     particle.ancestor_request_id
                 )
                 if ancestor is None or ancestor.sampling_params is None:
-                    #print(
-                    #    f"[SMC_DBG] SKIP particle={particle.new_request_id} "
-                    #    f"reason=ancestor_not_found "
-                    #    f"anc_id={particle.ancestor_request_id} "
-                    #    f"in_sched={particle.ancestor_request_id in self.scheduler.requests}",
-                    #    flush=True,
-                    #)
+                    print(
+                        f"[SMC_DBG] SKIP particle={particle.new_request_id} "
+                        f"reason=ancestor_not_found "
+                        f"anc_id={particle.ancestor_request_id} "
+                        f"in_sched={particle.ancestor_request_id in self.scheduler.requests}",
+                        flush=True,
+                    )
                     continue
 
                 # Clone sampling params and adjust max_tokens.
@@ -446,26 +435,26 @@ class EngineCore:
                     - particle.num_output_tokens
                 )
                 if remaining <= 0:
-                    #print(
-                    #    f"[SMC_DBG] SKIP particle={particle.new_request_id} "
-                    #    f"reason=budget_exhausted "
-                    #    f"anc_max_tokens={ancestor.sampling_params.max_tokens} "
-                    #    f"num_output={particle.num_output_tokens}",
-                    #    flush=True,
-                    #)
+                    print(
+                        f"[SMC_DBG] SKIP particle={particle.new_request_id} "
+                        f"reason=budget_exhausted "
+                        f"anc_max_tokens={ancestor.sampling_params.max_tokens} "
+                        f"num_output={particle.num_output_tokens}",
+                        flush=True,
+                    )
                     continue
                 new_sp.max_tokens = remaining
 
-                #print(
-                #    f"[SMC_DBG] CREATE particle={particle.new_request_id} "
-                #    f"slot={particle.slot_index} "
-                #    f"anc={particle.ancestor_request_id} "
-                #    f"anc_max_tokens={ancestor.sampling_params.max_tokens} "
-                #    f"anc_output_tokens={particle.num_output_tokens} "
-                #    f"remaining={remaining} "
-                #    f"prompt_len={len(particle.token_ids)}",
-                #    flush=True,
-                #)
+                print(
+                    f"[SMC_DBG] CREATE particle={particle.new_request_id} "
+                    f"slot={particle.slot_index} "
+                    f"anc={particle.ancestor_request_id} "
+                    f"anc_max_tokens={ancestor.sampling_params.max_tokens} "
+                    f"anc_output_tokens={particle.num_output_tokens} "
+                    f"remaining={remaining} "
+                    f"prompt_len={len(particle.token_ids)}",
+                    flush=True,
+                )
                 new_request = Request(
                     request_id=particle.new_request_id,
                     prompt_token_ids=particle.token_ids,
@@ -488,6 +477,14 @@ class EngineCore:
                 self._smc_new_particle_tokens[particle.new_request_id] = (
                     particle.token_ids, orig_prompt_len
                 )
+
+        # 2. Abort active losers (zombie-loser slots have no live request).
+        #breakpoint()
+        if action.loser_request_ids:
+            self.abort_requests(action.loser_request_ids)
+            # Clean up snapshot entries for aborted particles.
+            for rid in action.loser_request_ids:
+                self._smc_token_snapshot.pop(rid, None)
 
     def _smc_remap_outputs(
         self,
@@ -735,6 +732,7 @@ class EngineCore:
                     req = self.scheduler.requests.get(rid)
                     if req is not None:
                         self._smc_token_snapshot[rid] = list(req.all_token_ids)  # type: ignore[union-attr]
+                        #print(f"Updated token snapshot for request {rid}: {self._smc_token_snapshot[rid]}")
             resample_actions = self.smc_controller.maybe_resample(
                 self.scheduler.requests, self._smc_token_snapshot
             )
