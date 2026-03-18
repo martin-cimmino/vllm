@@ -115,7 +115,16 @@ class SMCController:
 
     @staticmethod
     def compute_ess(log_weights: list[float]) -> float:
-        """Effective sample size, normalized to [0, 1]."""
+        """Effective sample size, normalized to [0, 1].
+        
+        Given the weights w (which need not be normalized), we compute normalized 
+        weights first
+        w_norm_i = w_i / sum(w), 
+        and then compute ESS as
+        ESS = sum(w)^2 / (sum(w^2) * N)
+        where N is the total number of weights.
+        The input and computations are done in log-space for numerical stability.
+        """
         n = len(log_weights)
         if n == 0:
             return 0.0
@@ -141,8 +150,8 @@ class SMCController:
             s += wi
             cumsum.append(s)
         total = cumsum[-1]
-        # random offset in [0, total/n) for systematic resampling (even spacing with random start).
-        u = random.uniform(0, 1.0 / n)
+
+        u = random.uniform(0, 1.0)
         ancestors: list[int] = []
         j = 0
         # Iterate over evenly spaced positions in [0, total) and find their ancestor slots.
