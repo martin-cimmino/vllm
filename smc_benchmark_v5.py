@@ -237,9 +237,9 @@ class SMCInstrumentation:
             })
             return result
 
-        def patched_maybe_resample(ctrl_self, requests, token_snapshots=None) -> dict:
+        def patched_maybe_resample(ctrl_self, requests) -> dict:
             step_idx = len(instr.steps) - 1
-            actions = instr._orig_maybe_resample(ctrl_self, requests, token_snapshots)
+            actions = instr._orig_maybe_resample(ctrl_self, requests)
             for pid, action in actions.items():
                 event = {
                     "step": step_idx,
@@ -285,20 +285,6 @@ class SMCInstrumentation:
         return totals
 
 
-# ── Request ID → particle index mapping ──────────────────────────────
-
-
-def parse_particle_index(req_id: str) -> int | None:
-    """Extract particle index from '<idx>_<parent_id>' naming convention."""
-    parts = req_id.split("_", 1)
-    if len(parts) == 2:
-        try:
-            return int(parts[0])
-        except ValueError:
-            pass
-    return None
-
-
 # ── Prompt Template ───────────────────────────────────────────────────
 
 
@@ -320,6 +306,7 @@ def format_prompt(problem: str, tokenizer, thinking: bool = False) -> str:
                 print("[DEBUG] Enabling thinking mode for prompt template.", flush=True)
                 messages.append({"role": "system", "content": "\nthinking on\n"})
             messages.append({"role": "user", "content": query})
+            print(f"Input prompt with chat template applied: {tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)}")
             return tokenizer.apply_chat_template(
                 messages, tokenize=False, add_generation_prompt=True
             )

@@ -18,21 +18,11 @@ class NewParticle:
 
 
 @dataclass
-class ZombieClone:
-    """A zombie particle clone — no vLLM request, just controller tracking."""
-
-    new_request_id: str
-    slot_index: int
-    token_ids: list[int]  # copied from ancestor zombie (or active→zombie)
-
-
-@dataclass
 class ResampleAction:
     """Structured output from a resampling event."""
 
     loser_request_ids: list[str]  # active-slot IDs to abort
     new_particles: list[NewParticle]  # replacement live requests to create
-    zombie_clones: list[ZombieClone] = field(default_factory=list)
 
 
 @dataclass
@@ -49,10 +39,9 @@ class ParticleGroup:
     original_max_tokens: int = 0  # user-specified max_tokens (for adjustments)
     original_prompt_len: int = 0  # length of original prompt tokens
     # slot_index → cumulative log-weight frozen when that particle finished.
-    # Cleared after each resampling (zombies re-freeze next step with weight 0).
+    # Preserved across resampling events; zombie weights stay frozen for
+    # get_final_weights() voting.
     frozen_weights: dict = field(default_factory=dict)
-    # slot_index → token_ids of finished particle (preserved across resampling).
-    zombie_token_ids: dict = field(default_factory=dict)
 
 
 class SMCController:
@@ -156,7 +145,6 @@ class SMCController:
     def maybe_resample(
         self,
         requests: dict[str, "object"],
-        token_snapshots: "dict[str, list[int]] | None" = None,
     ) -> dict[str, ResampleAction]:
         """Check ESS for each group; resample if below threshold.
 
@@ -175,27 +163,21 @@ class SMCController:
 
         Args:
             requests: scheduler's requests dict (str → Request objects).
-            token_snapshots: optional rid → all_token_ids from last active step,
-                used to populate zombie_token_ids for newly finished particles.
 
         Returns:
             Mapping parent_req_id → ResampleAction for groups that resampled.
         """
         resample_actions: dict[str, ResampleAction] = {}
-        snaps = token_snapshots or {}
 
         for pid, group in list(self._groups.items()):
             n = len(group.child_request_ids)
             if n == 0:
                 continue
 
-            # Step 1: Detect newly finished particles; freeze weight + snapshot.
+            # Step 1: Detect newly finished particles; freeze weight.
             for i, rid in enumerate(group.child_request_ids):
                 if rid not in requests and i not in group.frozen_weights:
                     group.frozen_weights[i] = group.log_weights[i]
-                    snap = snaps.get(rid)
-                    if snap is not None:
-                        group.zombie_token_ids[i] = snap
 
             # Step 2: Identify active (non-frozen) slots and their weights.
             active_list = sorted(
@@ -282,7 +264,6 @@ class SMCController:
             resample_actions[pid] = ResampleAction(
                 loser_request_ids=active_loser_req_ids,
                 new_particles=new_particles,
-                zombie_clones=[],
             )
             #print("Old child IDs:", group.child_request_ids)
             #print("New child IDs after resampling:", new_child_ids)

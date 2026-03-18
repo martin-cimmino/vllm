@@ -408,7 +408,6 @@ def test_freezes_finished_particle_and_resamples_active() -> None:
     slot_indices = {p.slot_index for p in action.new_particles}
     assert slot_indices == {1, 2}
     assert 3 not in slot_indices
-    assert action.zombie_clones == []
 
     # After resample: active weights (slots 0, 1, 2) reset to 0.
     # Zombie slot 3 frozen_weight is preserved (-100.0 from before finishing).
@@ -535,7 +534,7 @@ def test_zombie_inclusive_ess_trigger() -> None:
 def test_zombie_ancestor_does_not_win_active_slots() -> None:
     """Resampling pool is active-only: zombie ancestors cannot replace active
     slots.  Active losers always get live NewParticle replacements from active
-    winners, never ZombieClone entries.  zombie_clones is always empty."""
+    winners."""
     ctrl = SMCController()
     ctrl.register_group(
         "p1", ["c0", "c1", "c2", "c3"], alpha=2.0, ess_threshold=0.5,
@@ -545,24 +544,17 @@ def test_zombie_ancestor_does_not_win_active_slots() -> None:
     # c0 finishes with weight 0 (best zombie); c1 has a good active weight,
     # c2/c3 have poor active weights → c1 should win among active slots.
     ctrl.accumulate({"c0": 0.0, "c1": -0.1, "c2": -100.0, "c3": -100.0})
-    zombie_tokens = [1, 2, 3, 10, 11, 12]  # prompt + 3 generated tokens
-    snapshots = {"c0": zombie_tokens}
     # c0 is zombie (absent from requests).
     reqs: dict[str, object] = {
         "c1": _make_fake_request("c1", [1, 2, 3, 100, 101], [100, 101]),
         "c2": _make_fake_request("c2", [1, 2, 3, 200, 201], [200, 201]),
         "c3": _make_fake_request("c3", [1, 2, 3, 300, 301], [300, 301]),
     }
-    actions = ctrl.maybe_resample(reqs, token_snapshots=snapshots)
+    actions = ctrl.maybe_resample(reqs)
 
     assert "p1" in actions
     action = actions["p1"]
-    # c0's zombie_token_ids should be populated from snapshots.
     group = ctrl._groups["p1"]
-    assert group.zombie_token_ids.get(0) == zombie_tokens
-
-    # No zombie clones — active-only resampling pool.
-    assert action.zombie_clones == []
 
     # c2, c3 are active losers; each gets a NewParticle from active winner c1.
     assert set(action.loser_request_ids) == {"c2", "c3"}

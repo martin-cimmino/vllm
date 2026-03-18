@@ -25,13 +25,13 @@ export VLLM_ENABLE_V1_MULTIPROCESSING=0
 # ── Default parameters (override via -- args after sbatch script) ─────
 MODEL=/leonardo_scratch/fast/AIFAC_L13_018/models/Domyn-Small-v0.2-bf16
 METHOD=both
-N_PARTICLES=16
-ALPHA=4.0
-ESS_THRESHOLD=0.7
+N_PARTICLES=64
+ALPHA=2.0
+ESS_THRESHOLD=0.5
 TEMPERATURE=1.0
 MAX_NEW_TOKENS=16384
 SEED=42
-ALPHA_RAMP_TOKENS=1000
+ALPHA_RAMP_TOKENS=100
 MAX_PROBLEMS=""
 THINKING="--thinking"
 

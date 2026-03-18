@@ -225,9 +225,9 @@ class SMCInstrumentation:
             })
             return result
 
-        def patched_maybe_resample(ctrl_self, requests, token_snapshots=None) -> dict:
+        def patched_maybe_resample(ctrl_self, requests) -> dict:
             step_idx = len(instr.steps) - 1  # step just accumulated
-            actions = instr._orig_maybe_resample(ctrl_self, requests, token_snapshots)
+            actions = instr._orig_maybe_resample(ctrl_self, requests)
             for pid, action in actions.items():
                 event = {
                     "step": step_idx,
@@ -461,7 +461,6 @@ def run_one(
     snis = snis_draw(answers, weight_vec, rng=torch.Generator().manual_seed(seed) if seed is not None else None)
 
     unique_answers = len({a for a in answers if a is not None})
-    n_correct = sum(1 for a in answers if a is not None and a != 0)  # placeholder
 
     return {
         "label": label,

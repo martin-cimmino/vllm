@@ -68,7 +68,7 @@ from vllm.v1.engine.utils import (
 from vllm.v1.executor import Executor
 from vllm.v1.kv_cache_interface import KVCacheConfig
 from vllm.v1.metrics.stats import SchedulerStats
-from vllm.v1.engine.smc_controller import SMCController, ResampleAction, ZombieClone
+from vllm.v1.engine.smc_controller import SMCController, ResampleAction
 from vllm.v1.outputs import ModelRunnerOutput
 from vllm.v1.request import Request, RequestStatus
 from vllm.v1.serial_utils import MsgpackDecoder, MsgpackEncoder
@@ -166,12 +166,6 @@ class EngineCore:
         # tells the detokenizer where the winner's generated tokens start, so it
         # can pre-populate output_token_ids with winner_gen + continuation.
         self._smc_new_particle_tokens: dict[str, tuple[list[int], int]] = {}
-        # Given rid formatted as "{index}_{parent_id}", where index is the integer index of 
-        # the child and parent_id is the request ID of the parent.
-        # Persistent token snapshot: rid → all_token_ids from the last step the
-        # particle was active. Enables zombie_token_ids population for particles
-        # that finish one step before maybe_resample detects them as absent.
-        self._smc_token_snapshot: dict[str, list[int]] = {}
 
         if self.scheduler.connector is not None:  # type: ignore
             self.model_executor.init_kv_output_aggregator(self.scheduler.connector)  # type: ignore
@@ -445,16 +439,16 @@ class EngineCore:
                     continue
                 new_sp.max_tokens = remaining
 
-                print(
-                    f"[SMC_DBG] CREATE particle={particle.new_request_id} "
-                    f"slot={particle.slot_index} "
-                    f"anc={particle.ancestor_request_id} "
-                    f"anc_max_tokens={ancestor.sampling_params.max_tokens} "
-                    f"anc_output_tokens={particle.num_output_tokens} "
-                    f"remaining={remaining} "
-                    f"prompt_len={len(particle.token_ids)}",
-                    flush=True,
-                )
+                #print(
+                #    f"[SMC_DBG] CREATE particle={particle.new_request_id} "
+                #    f"slot={particle.slot_index} "
+                #    f"anc={particle.ancestor_request_id} "
+                #    f"anc_max_tokens={ancestor.sampling_params.max_tokens} "
+                #    f"anc_output_tokens={particle.num_output_tokens} "
+                #    f"remaining={remaining} "
+                #    f"prompt_len={len(particle.token_ids)}",
+                #    flush=True,
+                #)
                 new_request = Request(
                     request_id=particle.new_request_id,
                     prompt_token_ids=particle.token_ids,
@@ -482,9 +476,6 @@ class EngineCore:
         #breakpoint()
         if action.loser_request_ids:
             self.abort_requests(action.loser_request_ids)
-            # Clean up snapshot entries for aborted particles.
-            for rid in action.loser_request_ids:
-                self._smc_token_snapshot.pop(rid, None)
 
     def _smc_remap_outputs(
         self,
@@ -596,20 +587,8 @@ class EngineCore:
         if model_output is not None and model_output.smc_log_weights:
             self._smc_auto_register_from_weights(model_output.smc_log_weights)
             self.smc_controller.accumulate(model_output.smc_log_weights)
-            # Update token snapshot for all active SMC particles.
-            # Particles that finish THIS step are still in scheduler.requests
-            # (update_from_output hasn't run yet), so their tokens are captured
-            # here and available next step when they're detected as zombies.
-            for grp in self.smc_controller._groups.values():
-                for rid in grp.child_request_ids:
-                    req = self.scheduler.requests.get(rid)
-                    if req is not None:
-                        # Update snapshot with current tokens for this request ID. 
-                        # We ensure the engine ensures that the SMC resampling 
-                        # process has access to the most up-to-date information about each particle's progress.
-                        self._smc_token_snapshot[rid] = list(req.all_token_ids)  # type: ignore[union-attr]
             resample_actions = self.smc_controller.maybe_resample(
-                self.scheduler.requests, self._smc_token_snapshot
+                self.scheduler.requests
             )
             if resample_actions:
                 self._apply_resample_actions(resample_actions)
@@ -726,15 +705,8 @@ class EngineCore:
         if model_output is not None and model_output.smc_log_weights:
             self._smc_auto_register_from_weights(model_output.smc_log_weights)
             self.smc_controller.accumulate(model_output.smc_log_weights)
-            # Update token snapshot for all active SMC particles.
-            for grp in self.smc_controller._groups.values():
-                for rid in grp.child_request_ids:
-                    req = self.scheduler.requests.get(rid)
-                    if req is not None:
-                        self._smc_token_snapshot[rid] = list(req.all_token_ids)  # type: ignore[union-attr]
-                        #print(f"Updated token snapshot for request {rid}: {self._smc_token_snapshot[rid]}")
             resample_actions = self.smc_controller.maybe_resample(
-                self.scheduler.requests, self._smc_token_snapshot
+                self.scheduler.requests
             )
             if resample_actions:
                 self._apply_resample_actions(resample_actions)
