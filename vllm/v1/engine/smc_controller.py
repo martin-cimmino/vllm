@@ -4,6 +4,10 @@ import math
 import random
 from dataclasses import dataclass, field
 
+from vllm.logger import init_logger
+
+logger = init_logger(__name__)
+
 
 @dataclass
 class NewParticle:
@@ -89,18 +93,14 @@ class SMCController:
         """Add incremental log-weights from this step to each group."""
         for pid, group in self._groups.items():
             for i, req_id in enumerate(group.child_request_ids):
-                if req_id in smc_log_weights:
+                # Only accumulate for active particles.
+                # Some frozen particles may still be active in the current step as
+                # active loser with frozen ancestor cannot be aborted so it is
+                # important to exclude frozen particles from accumulation to prevent
+                # their fixed weights from being incorrectly inflated by active incremental weights.
+                if req_id in smc_log_weights and i not in group.frozen_weights:
                     group.log_weights[i] += smc_log_weights[req_id]
             group.step_count += 1
-            #if group.step_count % 200 == 0:
-                #active = sum(1 for i in range(len(group.child_request_ids))
-                #             if i not in group.frozen_weights)
-                #print(
-                #    f"[SMC_HB] group={pid} step={group.step_count} "
-                #    f"active={active}/{len(group.child_request_ids)} "
-                #    f"frozen={len(group.frozen_weights)}",
-                #    flush=True,
-                #)
 
     @staticmethod
     def compute_ess(log_weights: list[float]) -> float:
@@ -148,18 +148,50 @@ class SMCController:
     ) -> dict[str, ResampleAction]:
         """Check ESS for each group; resample if below threshold.
 
-        ESS is computed over ALL N weights (zombie-inclusive): finished
-        particles keep their frozen weight while active particles accumulate
-        negative incremental weights, so zombie weights rapidly dominate →
-        ESS collapses → resampling fires frequently (matching reference).
+        Terminology
+        -----------
+        A *frozen* particle is one that has finished generating (absent from
+        ``requests``).  Its accumulated log-weight is stored in
+        ``frozen_weights`` and never changes.
 
-        Resampling itself operates over ACTIVE slots only.  Zombies cannot
-        produce new vLLM requests (they have no KV state to resume from), so
-        they are excluded from the resampling pool.  Zombie weights contribute
-        to the ESS trigger but winners are always drawn from active particles.
+        ESS trigger
+        -----------
+        ESS is computed over **all N weights** (frozen-inclusive).  As active
+        particles accumulate negative incremental weights while frozen weights
+        stay fixed, a high-weight frozen particle can dominate → ESS collapses
+        → resampling fires.
 
-        After resampling, active slot weights are reset to 0 (uniform). Zombie
-        frozen_weights are preserved so that get_final_weights() can use them.
+        Resampling pool
+        ---------------
+        Resampling is drawn from **all N slots** (frozen + active) via
+        systematic resampling over ``group.log_weights``.  Three outcomes
+        depending on the winning ancestor's status:
+
+        * **Active ancestor wins** — the loser is replaced by a new vLLM
+          request that clones the winner's token sequence.
+
+          - Active loser: its live request is added to ``loser_request_ids``
+            for abortion; the slot gets a fresh ``NewParticle``.
+          - Frozen loser: it is removed from ``frozen_weights`` ("revived");
+            the slot also gets a fresh ``NewParticle``.
+
+        * **Frozen ancestor wins** — no new vLLM request is created (there is
+          no live KV state to clone from).  The loser slot inherits the
+          winner's frozen weight and is added to ``frozen_weights``.  If the
+          loser was active, its live request is **not** aborted (to maintain
+          the scheduler's N-slot invariant — aborting without replacement
+          causes engine halt).  The slot is frozen and its future weight
+          accumulation is suppressed via the ``accumulate()`` guard; the
+          orphaned request runs to natural completion.
+
+        * **Active ancestor with exhausted budget** — the ancestor has no
+          remaining tokens.  No replacement can be created.  The loser slot
+          is frozen in place (same treatment as frozen-ancestor wins).
+
+        After resampling, only slots not present in ``frozen_weights`` have
+        their ``log_weights`` reset to 0 (i.e. the uniform post-resample
+        distribution).  Frozen slots retain their stored weight so that
+        ``get_final_weights()`` can use them for importance-weighted voting.
 
         Args:
             requests: scheduler's requests dict (str → Request objects).
@@ -174,41 +206,41 @@ class SMCController:
             if n == 0:
                 continue
 
-            # Step 1: Detect newly finished particles; freeze weight.
+            # 1. Detect newly finished particles; freeze their weight.
             for i, rid in enumerate(group.child_request_ids):
                 if rid not in requests and i not in group.frozen_weights:
                     group.frozen_weights[i] = group.log_weights[i]
 
-            # Step 2: Identify active (non-frozen) slots and their weights.
-            active_list = sorted(
-                i for i in range(n) if i not in group.frozen_weights
+            # 2. Skip if all particles are finished.
+            has_active = any(
+                i not in group.frozen_weights for i in range(n)
             )
-            if not active_list:
-                continue  # All particles finished — nothing to resample.
+            if not has_active:
+                continue
 
-            # Step 3: ESS over ACTIVE weights only.
-            active_weights = [group.log_weights[i] for i in active_list]
-            #ess = self.compute_ess(active_weights)
+            # 3. Check ESS over all N weights (frozen-inclusive).
             ess = self.compute_ess(group.log_weights)
-            
             if ess >= group.ess_threshold:
                 continue
 
-            # Step 4: Systematic resample over ACTIVE slots only as we cannot clone zombies.
-            anc_pos = self.systematic_resample(active_weights)
+            logger.debug("Log weights before resampling: %s",
+                         group.log_weights)
+            logger.debug("Frozen weights before resampling: %s",
+                         group.frozen_weights)
 
-            # Get ancestor slots (indices in child_request_ids) for each active slot.
-            ancestor_slots = {active_list[j] for j in anc_pos}
-            #print(f"active_list={active_list} anc_pos={anc_pos} ancestor_slots={ancestor_slots} -> {[active_list[j] for j in anc_pos]} winners: {[active_list[anc_pos[i]] for i in range(len(anc_pos)) if active_list[anc_pos[i]]==active_list[i]]}")
-            
+            # 4. Systematic resample over all N slots (frozen + active).
+            ancestors = self.systematic_resample(group.log_weights)
+
+            # 5. Gather token sequences from active ancestors (for cloning).
             ancestor_token_seqs: dict[int, list[int]] = {}
             ancestor_output_lens: dict[int, int] = {}
             ancestor_max_tokens: dict[int, int] = {}
-            for slot in ancestor_slots:
+            for slot in set(ancestors):
+                if slot in group.frozen_weights:
+                    continue  # Frozen ancestor — no live KV state to clone.
                 rid = group.child_request_ids[slot]
                 req = requests.get(rid)
                 if req is not None:
-                    #print(f"Found active ancestor request {rid} with tokens {len(list(req.all_token_ids))}")
                     ancestor_token_seqs[slot] = list(req.all_token_ids)  # type: ignore[union-attr]
                     ancestor_output_lens[slot] = len(req._output_token_ids)  # type: ignore[union-attr]
                     sp = req.sampling_params  # type: ignore[union-attr]
@@ -217,20 +249,71 @@ class SMCController:
                         else group.original_max_tokens
                     )
 
-            # Step 6: Build NewParticles for loser active slots.
-            # Use resolved true-winner ancestors (not proxy intermediaries).
+            # 6. Build NewParticles for loser slots.
+            # Proxy ancestors are valid because new requests are created before
+            # losers are aborted (abort-after-create in core.py).
             active_loser_req_ids: list[str] = []
             new_particles: list[NewParticle] = []
             new_child_ids: list[str] = list(group.child_request_ids)
+            frozen_weights_to_remove: list[int] = []
 
-            for j, slot_idx in enumerate(active_list):
-                true_anc_slot = active_list[anc_pos[j]]
-                if slot_idx == true_anc_slot:
-                    continue  # True winner — stays in its slot.
+            # Snapshot frozen_weights before the loop so that all slot
+            # decisions are based on pre-resample state.  Without this, a
+            # slot k that becomes frozen during iteration (because its own
+            # ancestor is frozen) would cause later slots pointing to k to
+            # incorrectly inherit its frozen weight instead of getting a new
+            # particle from k.
+            frozen_before_resample = set(group.frozen_weights)
 
-                #print(f"j={j} slot_idx={slot_idx} anc_pos={anc_pos[j]} true_anc_slot={true_anc_slot}")
+            for slot_idx in range(n):
+                anc_idx = ancestors[slot_idx]
+                if slot_idx == anc_idx:
+                    continue  # Winner — stays in its slot.
 
-                active_loser_req_ids.append(group.child_request_ids[slot_idx])
+                # --- Frozen ancestor: cannot clone (no live KV state). ---
+                # Loser inherits the ancestor's frozen weight and becomes
+                # frozen itself.  Active losers are NOT aborted (no
+                # replacement → scheduler halt).
+                if anc_idx in frozen_before_resample:
+                    group.frozen_weights[slot_idx] = (
+                        group.frozen_weights[anc_idx]
+                    )
+                    group.log_weights[slot_idx] = (
+                        group.frozen_weights[slot_idx]
+                    )
+                    logger.debug(
+                        "Slot %d: frozen ancestor %d (w=%.4f), "
+                        "freezing slot", slot_idx, anc_idx,
+                        group.frozen_weights[anc_idx])
+                    continue
+
+                # --- Active ancestor: check remaining token budget. ---
+                token_ids = ancestor_token_seqs.get(anc_idx, [])
+                num_output = ancestor_output_lens.get(anc_idx, 0)
+                anc_max_tokens = ancestor_max_tokens.get(
+                    anc_idx, group.original_max_tokens
+                )
+                remaining = anc_max_tokens - num_output
+                if remaining <= 0:
+                    # Ancestor exhausted — freeze slot, don't abort
+                    # (same rationale as frozen-ancestor case).
+                    group.frozen_weights[slot_idx] = group.log_weights[
+                        slot_idx
+                    ]
+                    logger.debug(
+                        "Slot %d: ancestor %d exhausted budget "
+                        "(max=%d, output=%d), freezing slot",
+                        slot_idx, anc_idx, anc_max_tokens, num_output)
+                    continue
+
+                # --- Safe to abort loser and create replacement. ---
+                if slot_idx not in frozen_before_resample:
+                    active_loser_req_ids.append(
+                        group.child_request_ids[slot_idx]
+                    )
+                else:
+                    # Frozen loser revived by an active winner.
+                    frozen_weights_to_remove.append(slot_idx)
 
                 new_id = f"smc_{pid}_{group.step_count}_{slot_idx}"
                 original_child = self.get_original_id(
@@ -239,47 +322,40 @@ class SMCController:
                 self._id_to_original[new_id] = original_child
                 new_child_ids[slot_idx] = new_id
 
-                token_ids = ancestor_token_seqs.get(true_anc_slot, [])
-                num_output = ancestor_output_lens.get(true_anc_slot, 0)
-                anc_max_tokens = ancestor_max_tokens.get(
-                    true_anc_slot, group.original_max_tokens
-                )
-                remaining = anc_max_tokens - num_output
-                if remaining <= 0:
-                    print(f"Ancestor slot {true_anc_slot} has no remaining tokens (max={anc_max_tokens} output={num_output}), skipping new particle")
-                    continue
-                
                 new_particles.append(NewParticle(
                     new_request_id=new_id,
-                    ancestor_request_id=group.child_request_ids[true_anc_slot],
+                    ancestor_request_id=group.child_request_ids[anc_idx],
                     token_ids=token_ids,
                     slot_index=slot_idx,
                     original_max_tokens=anc_max_tokens,
                     num_output_tokens=num_output,
                 ))
 
-            #print(f"Resampling group {pid}: {len(active_loser_req_ids)} losers")
-            #print(f"Loser request IDs: {active_loser_req_ids}")
+            # De-freeze slots revived by an active winner.
+            for slot_idx in frozen_weights_to_remove:
+                del group.frozen_weights[slot_idx]
+
+            logger.debug("Loser request IDs: %s", active_loser_req_ids)
 
             resample_actions[pid] = ResampleAction(
                 loser_request_ids=active_loser_req_ids,
                 new_particles=new_particles,
             )
-            #print("Old child IDs:", group.child_request_ids)
-            #print("New child IDs after resampling:", new_child_ids)
+            logger.debug("Old child IDs: %s", group.child_request_ids)
+            logger.debug("New child IDs: %s", new_child_ids)
 
-            # update group state for new particles: replace losers with new IDs, keep winners in place.
             group.child_request_ids = new_child_ids
 
-            #breakpoint()
+            # 7. Reset non-frozen weights to 0 (uniform after resample).
+            # Frozen weights are preserved for get_final_weights() voting.
+            for i in range(n):
+                if i not in group.frozen_weights:
+                    group.log_weights[i] = 0.0
 
-            # Step 7: Reset ACTIVE weights to 0 (uniform after resample).
-            # Zombie frozen_weights are preserved — they represent accumulated
-            # SMC weight at finishing time and are needed for get_final_weights().
-            # Clearing them would reset zombie weights to 0, which would cause
-            # zombie-inclusive ESS to collapse every subsequent step (infinite loop).
-            for i in active_list:
-                group.log_weights[i] = 0.0
+            logger.debug("Log weights after resampling: %s",
+                         group.log_weights)
+            logger.debug("Frozen weights after resampling: %s",
+                         group.frozen_weights)
 
         return resample_actions
 
