@@ -376,11 +376,15 @@ def test_max_tokens_in_new_particle() -> None:
 
 
 def test_freezes_finished_particle_and_resamples_active() -> None:
-    """When a particle finishes, ESS is computed over ALL N weights (zombie-
-    inclusive). ESS collapse is driven by zombie vs active weight divergence.
-    Resampling only touches active slots — zombie slots stay as-is.
-    After resample, only active weights reset to 0; zombie log_weights are
-    preserved at their frozen value."""
+    """When a particle finishes, ESS is computed over ALL N weights
+    (frozen-inclusive).  Resampling draws from all N slots.
+
+    Active winner (c0) beats all three losers:
+    - Active losers (c1, c2) are aborted and replaced by new particles.
+    - Frozen loser (c3) is "revived" — removed from frozen_weights and
+      also replaced by a new particle from c0.
+
+    After resample all replaced slots are active; all weights reset to 0."""
     ctrl = SMCController()
     ctrl.register_group(
         "p1", ["c0", "c1", "c2", "c3"], alpha=2.0, ess_threshold=0.5,
@@ -395,26 +399,24 @@ def test_freezes_finished_particle_and_resamples_active() -> None:
 
     group = ctrl._groups["p1"]
 
-    # Resampling fires because ESS over all 4 weights (0, -100, -100, -100)
-    # is ~0.25 < 0.5.
+    # Resampling fires: ESS over all 4 weights (0, -100, -100, -100) ≈ 0.25 < 0.5.
     assert "p1" in actions
     action = actions["p1"]
 
-    # Active losers: c1 and c2 (slot 3 was zombie, no live request to abort).
+    # Active losers c1, c2 are aborted (frozen loser c3 has no live request).
     assert set(action.loser_request_ids) == {"c1", "c2"}
 
-    # Zombie slot 3 is NOT included in the active-only resampling pool.
-    # c0 dominates among active → slots 1 and 2 get NewParticles from c0.
+    # All three loser slots (1, 2, 3) get new particles from active winner c0.
+    # Frozen slot 3 is revived by the active ancestor.
     slot_indices = {p.slot_index for p in action.new_particles}
-    assert slot_indices == {1, 2}
-    assert 3 not in slot_indices
-    assert action.zombie_clones == []
+    assert slot_indices == {1, 2, 3}
+    for p in action.new_particles:
+        assert p.ancestor_request_id == "c0"
 
-    # After resample: active weights (slots 0, 1, 2) reset to 0.
-    # Zombie slot 3 frozen_weight is preserved (-100.0 from before finishing).
-    assert group.log_weights[:3] == [0.0, 0.0, 0.0]
-    assert group.log_weights[3] == pytest.approx(-100.0)
-    assert 3 in group.frozen_weights
+    # After resample: all 4 weights reset to 0 (all slots are now active).
+    assert group.log_weights == [0.0, 0.0, 0.0, 0.0]
+    # Slot 3 was de-frozen (revived by active winner).
+    assert 3 not in group.frozen_weights
 
 
 def test_all_particles_finished_skips_group() -> None:
@@ -469,18 +471,18 @@ def test_get_final_weights_returns_empty_for_unknown_group() -> None:
     assert ctrl.get_final_weights("nonexistent") == {}
 
 
-def test_zombie_inclusive_ess_trigger() -> None:
-    """Resampling uses zombie-inclusive (all-N) ESS for the trigger.
+def test_frozen_inclusive_ess_trigger() -> None:
+    """Resampling uses frozen-inclusive (all-N) ESS for the trigger.
 
-    Sub-test 1: zombie weight better than active weights → zombie-inclusive
-    ESS collapses below threshold → resample fires (zombie stays frozen,
-    not included in loser list).
+    Sub-test 1: frozen weight better than active weights → all-N ESS
+    collapses below threshold → resample fires.  Frozen winner (c3) is a
+    self-winner — it does NOT appear in loser_request_ids.
 
     Sub-test 2: all-N weights uniform → ESS = 1.0 → no resample.
 
     Sub-test 3: divergent active weights → ESS < threshold → resample fires.
     """
-    # Sub-test 1: zombie has better weight (-1) than active weights (-4 each).
+    # Sub-test 1: frozen c3 has better weight (-1) than active (-4 each).
     # All-N ESS over [-4,-4,-4,-1] ≈ 0.33 < 0.5 → fires.
     ctrl = SMCController()
     ctrl.register_group(
@@ -489,16 +491,16 @@ def test_zombie_inclusive_ess_trigger() -> None:
     )
     ctrl.accumulate({"c0": -1.0, "c1": -1.0, "c2": -1.0, "c3": -1.0})
     ctrl.accumulate({"c0": -3.0, "c1": -3.0, "c2": -3.0})
-    # All-N weights: [-4, -4, -4, -1]; zombie (-1) dominates active (-4 each).
+    # All-N weights: [-4, -4, -4, -1]; frozen c3 (-1) dominates active (-4).
     reqs: dict[str, object] = {}
     for rid in ["c0", "c1", "c2"]:
         reqs[rid] = _make_fake_request(rid, [1, 2, 3, 100], [100])
     actions = ctrl.maybe_resample(reqs)
     assert "p1" in actions, (
-        "Zombie-inclusive ESS collapse should trigger resample "
-        "(zombie weight -1 dominates active -4)"
+        "Frozen-inclusive ESS collapse should trigger resample "
+        "(frozen weight -1 dominates active -4)"
     )
-    # c3 is a zombie — it must NOT appear in loser_request_ids.
+    # c3 is the frozen winner — must NOT appear in loser_request_ids.
     assert "c3" not in actions["p1"].loser_request_ids
 
     # Sub-test 2: all-N weights uniform → ESS = 1.0 → no resample.
@@ -523,7 +525,7 @@ def test_zombie_inclusive_ess_trigger() -> None:
         alpha_ramp_tokens=0, original_max_tokens=100,
     )
     ctrl3.accumulate({"c0": 0.0, "c1": -100.0, "c2": -100.0, "c3": -1.0})
-    # c3 zombie (weight -1), active c0=0 dominates c1=-100, c2=-100.
+    # frozen c3 (weight -1), active c0=0 dominates c1=-100, c2=-100.
     # All-N ESS ≈ 0.41 < 0.5 → fires.
     reqs3: dict[str, object] = {}
     for rid in ["c0", "c1", "c2"]:
@@ -532,72 +534,70 @@ def test_zombie_inclusive_ess_trigger() -> None:
     assert "p1" in actions3, "Divergent active weights should trigger resample"
 
 
-def test_zombie_ancestor_does_not_win_active_slots() -> None:
-    """Resampling pool is active-only: zombie ancestors cannot replace active
-    slots.  Active losers always get live NewParticle replacements from active
-    winners, never ZombieClone entries.  zombie_clones is always empty."""
+def test_frozen_winner_propagates_frozen_status_to_losers() -> None:
+    """When a frozen particle wins the resample, loser slots cannot receive
+    new particles (no live KV state to clone).  Instead each loser inherits
+    the winner's frozen weight and is added to frozen_weights.  Live requests
+    in those loser slots are NOT aborted — they keep running but are treated
+    as frozen for SMC tracking."""
     ctrl = SMCController()
     ctrl.register_group(
         "p1", ["c0", "c1", "c2", "c3"], alpha=2.0, ess_threshold=0.5,
         alpha_ramp_tokens=0, original_max_tokens=100,
         original_prompt_len=3,
     )
-    # c0 finishes with weight 0 (best zombie); c1 has a good active weight,
-    # c2/c3 have poor active weights → c1 should win among active slots.
-    ctrl.accumulate({"c0": 0.0, "c1": -0.1, "c2": -100.0, "c3": -100.0})
-    zombie_tokens = [1, 2, 3, 10, 11, 12]  # prompt + 3 generated tokens
-    snapshots = {"c0": zombie_tokens}
-    # c0 is zombie (absent from requests).
+    # c0 finishes with weight 0 (best overall); active c1/c2/c3 have very poor
+    # weights → frozen c0 dominates → ESS ≈ 0.25 < 0.5 → fires.
+    ctrl.accumulate({"c0": 0.0, "c1": -100.0, "c2": -100.0, "c3": -100.0})
+    # c0 is frozen (absent from requests).
     reqs: dict[str, object] = {
         "c1": _make_fake_request("c1", [1, 2, 3, 100, 101], [100, 101]),
         "c2": _make_fake_request("c2", [1, 2, 3, 200, 201], [200, 201]),
         "c3": _make_fake_request("c3", [1, 2, 3, 300, 301], [300, 301]),
     }
-    actions = ctrl.maybe_resample(reqs, token_snapshots=snapshots)
+    actions = ctrl.maybe_resample(reqs)
 
     assert "p1" in actions
     action = actions["p1"]
-    # c0's zombie_token_ids should be populated from snapshots.
     group = ctrl._groups["p1"]
-    assert group.zombie_token_ids.get(0) == zombie_tokens
 
-    # No zombie clones — active-only resampling pool.
-    assert action.zombie_clones == []
+    # Frozen winner cannot be cloned → no new particles created.
+    assert action.new_particles == []
+    # Active losers are NOT aborted (no replacement → scheduler halt).
+    assert action.loser_request_ids == []
 
-    # c2, c3 are active losers; each gets a NewParticle from active winner c1.
-    assert set(action.loser_request_ids) == {"c2", "c3"}
-    assert len(action.new_particles) == 2
-    for p in action.new_particles:
-        assert isinstance(p, NewParticle)
-        assert p.ancestor_request_id == "c1"
-
-    # After resample: active weights (c1, c2, c3 → slots 1, 2, 3) reset to 0.
-    # Zombie slot 0 (c0) frozen_weight preserved (0.0 from before finishing).
-    assert group.log_weights[1:] == [0.0, 0.0, 0.0]
+    # All three loser slots inherited c0's frozen weight and are now frozen.
+    for i in (1, 2, 3):
+        assert i in group.frozen_weights
+        assert group.frozen_weights[i] == pytest.approx(0.0)
+        assert group.log_weights[i] == pytest.approx(0.0)
+    # Slot 0 (c0) was already frozen; still preserved.
     assert 0 in group.frozen_weights
 
 
-def test_weights_reset_active_only_after_resample_with_zombie() -> None:
-    """After resampling with a zombie present, only ACTIVE weights reset to 0.
-    Zombie frozen_weights are preserved for get_final_weights() voting."""
+def test_frozen_winner_active_losers_become_frozen() -> None:
+    """When a frozen particle wins the resample, active loser slots are added
+    to frozen_weights (not reset to 0).  Only slots that remain genuinely
+    active after the update have their weights reset to 0."""
     ctrl = SMCController()
     ctrl.register_group(
         "p1", ["c0", "c1", "c2", "c3"], alpha=2.0, ess_threshold=0.5,
         alpha_ramp_tokens=0, original_max_tokens=100,
     )
-    # c3 finishes at -1.0; active c0 dominates with 0.0.
-    ctrl.accumulate({"c0": 0.0, "c1": -100.0, "c2": -100.0, "c3": -1.0})
-    ctrl.accumulate({"c0": -2.0, "c1": -2.0, "c2": -2.0})
-    # Active weights: [-2, -102, -102]; c0 dominates active ESS → fires.
+    # c3 finishes at -0.01 (near-zero, best weight by far).
+    # Active c0/c1/c2 accumulate -10.0 → frozen c3 dominates all 4 positions.
+    ctrl.accumulate({"c0": -10.0, "c1": -10.0, "c2": -10.0, "c3": -0.01})
     reqs: dict[str, object] = {}
     for rid in ["c0", "c1", "c2"]:
         reqs[rid] = _make_fake_request(rid, [1, 2, 3, 100], [100])
     ctrl.maybe_resample(reqs)
     group = ctrl._groups["p1"]
-    # Only active slots 0, 1, 2 reset to 0; zombie slot 3 frozen at -1.0.
-    assert group.log_weights[:3] == [0.0, 0.0, 0.0]
-    assert group.log_weights[3] == pytest.approx(-1.0)
-    assert group.frozen_weights == {3: pytest.approx(-1.0)}
+    # All active losers (c0, c1, c2) inherited c3's frozen weight; all frozen.
+    for i in range(4):
+        assert i in group.frozen_weights
+        assert group.frozen_weights[i] == pytest.approx(-0.01)
+        assert group.log_weights[i] == pytest.approx(-0.01)
+    # No active slots remain → nothing was reset to 0.
 
 
 def test_exhausted_budget_skipped() -> None:
@@ -617,8 +617,12 @@ def test_exhausted_budget_skipped() -> None:
     }
     actions = ctrl.maybe_resample(reqs)
     action = actions["p1"]
-    # Slot 1 should have no new particle (remaining=0)
+    group = ctrl._groups["p1"]
+    # Slot 1 should have no new particle (remaining=0) and no abort.
     assert len(action.new_particles) == 0
+    assert action.loser_request_ids == []
+    # Slot 1 is frozen in place (budget-exhaustion freeze).
+    assert 1 in group.frozen_weights
 
 
 # ─── Phase 3: static output field checks (no model required) ─────────────────
