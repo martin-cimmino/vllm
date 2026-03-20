@@ -337,6 +337,26 @@ class EngineCore:
 
         self.scheduler.add_request(request)
 
+    def _smc_check_done_groups(self) -> list[str]:
+        """Check if any SMC groups have all particles finished.
+
+        Returns original child IDs to release in the output processor
+        (their retained RequestStates should be cleaned up).
+        """
+        release_ids: list[str] = []
+        for pid in list(self.smc_controller._groups):
+            group = self.smc_controller._groups[pid]
+            all_done = all(
+                cid not in self.scheduler.requests
+                for cid in group.child_request_ids
+            )
+            if all_done:
+                for cid in group.child_request_ids:
+                    release_ids.append(
+                        self.smc_controller.get_original_id(cid))
+                self.smc_controller.unregister_group(pid)
+        return release_ids
+
     def _smc_auto_register_from_weights(
         self, smc_log_weights: dict[str, float]
     ) -> None:
@@ -406,13 +426,10 @@ class EngineCore:
                     particle.ancestor_request_id
                 )
                 if ancestor is None or ancestor.sampling_params is None:
-                    print(
-                        f"[SMC_DBG] SKIP particle={particle.new_request_id} "
-                        f"reason=ancestor_not_found "
-                        f"anc_id={particle.ancestor_request_id} "
-                        f"in_sched={particle.ancestor_request_id in self.scheduler.requests}",
-                        flush=True,
-                    )
+                    logger.debug(
+                        "SKIP particle=%s: ancestor %s not found",
+                        particle.new_request_id,
+                        particle.ancestor_request_id)
                     continue
 
                 # Clone sampling params and adjust max_tokens.
@@ -429,26 +446,15 @@ class EngineCore:
                     - particle.num_output_tokens
                 )
                 if remaining <= 0:
-                    print(
-                        f"[SMC_DBG] SKIP particle={particle.new_request_id} "
-                        f"reason=budget_exhausted "
-                        f"anc_max_tokens={ancestor.sampling_params.max_tokens} "
-                        f"num_output={particle.num_output_tokens}",
-                        flush=True,
-                    )
+                    logger.debug(
+                        "SKIP particle=%s: budget exhausted "
+                        "(max_tokens=%d, output=%d)",
+                        particle.new_request_id,
+                        ancestor.sampling_params.max_tokens,
+                        particle.num_output_tokens)
                     continue
                 new_sp.max_tokens = remaining
 
-                #print(
-                #    f"[SMC_DBG] CREATE particle={particle.new_request_id} "
-                #    f"slot={particle.slot_index} "
-                #    f"anc={particle.ancestor_request_id} "
-                #    f"anc_max_tokens={ancestor.sampling_params.max_tokens} "
-                #    f"anc_output_tokens={particle.num_output_tokens} "
-                #    f"remaining={remaining} "
-                #    f"prompt_len={len(particle.token_ids)}",
-                #    flush=True,
-                #)
                 new_request = Request(
                     request_id=particle.new_request_id,
                     prompt_token_ids=particle.token_ids,
@@ -472,8 +478,8 @@ class EngineCore:
                     particle.token_ids, orig_prompt_len
                 )
 
-        # 2. Abort active losers (zombie-loser slots have no live request).
-        #breakpoint()
+        # 2. Abort losers (frozen losers may have no live scheduler request
+        # — finish_requests safely skips unknown IDs).
         if action.loser_request_ids:
             self.abort_requests(action.loser_request_ids)
 
@@ -490,10 +496,10 @@ class EngineCore:
             return
         for outputs in engine_core_outputs.values():
             for output in outputs.outputs:
-                internal_id = output.request_id
-                original = self.smc_controller._id_to_original.get(internal_id)
+                internal_id = output.request_id # possibly smc_rid_idx
+                original = self.smc_controller._id_to_original.get(internal_id) # get idx_rid
                 if original is not None:
-                    output.request_id = original
+                    output.request_id = original # replace idx_rid to smc_rid_idx
                     # Only reset the detokenizer on the first output from this
                     # replacement particle (to flush the loser's accumulated
                     # tokens). Subsequent outputs from the same particle must
@@ -604,6 +610,13 @@ class EngineCore:
         # external-facing child IDs so the OutputProcessor can find them.
         if engine_core_outputs:
             self._smc_remap_outputs(engine_core_outputs)
+
+        # Check for fully-done SMC groups → release retained states
+        if self.smc_controller._groups:
+            smc_release_ids = self._smc_check_done_groups()
+            if smc_release_ids and engine_core_outputs:
+                for outputs_obj in engine_core_outputs.values():
+                    outputs_obj.smc_release_ids = smc_release_ids
 
         return engine_core_outputs, scheduler_output.total_num_scheduled_tokens > 0
 
@@ -721,6 +734,13 @@ class EngineCore:
         # SMC output ID remapping
         if engine_core_outputs:
             self._smc_remap_outputs(engine_core_outputs)
+
+        # Check for fully-done SMC groups → release retained states
+        if self.smc_controller._groups:
+            smc_release_ids = self._smc_check_done_groups()
+            if smc_release_ids and engine_core_outputs:
+                for outputs_obj in engine_core_outputs.values():
+                    outputs_obj.smc_release_ids = smc_release_ids
 
         # NOTE(nick): We can either handle the deferred tasks here or save
         # in a field and do it immediately once step_with_batch_queue is

@@ -311,6 +311,13 @@ class LLMEngine:
             )
             self.output_processor.update_scheduler_stats(outputs.scheduler_stats)
 
+        # Release retained SMC states for fully-done groups and
+        # emit their final aggregated outputs.
+        if outputs.smc_release_ids:
+            smc_outputs = self.output_processor.release_smc_retained(
+                outputs.smc_release_ids)
+            processed_outputs.request_outputs.extend(smc_outputs)
+
         # 3) Abort any reqs that finished due to stop strings.
         with record_function_or_nullcontext("llm_engine step: abort_requests"):
             self.engine_core.abort_requests(processed_outputs.reqs_to_abort)

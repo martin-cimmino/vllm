@@ -172,6 +172,7 @@ class RequestState:
         self.is_prefilling = True
         self.queue = queue
         self.num_cached_tokens = 0
+        self.smc_retained = False
 
         self.stats = RequestStateStats(arrival_time=arrival_time) if log_stats else None
 
@@ -637,14 +638,9 @@ class OutputProcessor:
                         engine_core_output.smc_winner_token_ids,
                         engine_core_output.smc_winner_prompt_len or 0,
                     )
-                    #print(
-                    #    f"[SMC_DBG] RESET req={req_id} "
-                    #    f"before_tokens={_before} "
-                    #    f"winner_len={len(engine_core_output.smc_winner_token_ids) if engine_core_output.smc_winner_token_ids else 0} "
-                    #    f"winner_prompt_len={engine_core_output.smc_winner_prompt_len} "
-                    #    f"num_cached_tokens={engine_core_output.num_cached_tokens}",
-                    #    flush=True,
-                    #)
+                    # Clear retained flag — replacement is taking over.
+                    if req_state.smc_retained:
+                        req_state.smc_retained = False
 
             if pooling_output is None:
                 assert req_state.detokenizer is not None
@@ -661,47 +657,56 @@ class OutputProcessor:
                 # if required.
                 req_state.logprobs_processor.update_from_output(engine_core_output)
 
-            # 4) Create and handle RequestOutput objects.
-            if request_output := req_state.make_request_output(
-                new_token_ids,
-                pooling_output,
-                finish_reason,
-                stop_reason,
-                kv_transfer_params,
-                routed_experts,
-                smc_log_weight,
-            ):
-                if req_state.streaming_input:
-                    request_output.finished = False
+            # SMC retain check: if this SMC child is finishing, mark it
+            # retained BEFORE make_request_output so get_outputs() sees
+            # child_requests as non-empty and holds back the aggregated
+            # result.  The replacement particle will emit the real output.
+            smc_retaining = False
+            if finish_reason is not None and not req_state.streaming_input:
+                is_smc_child = (
+                    req_state.parent_req is not None
+                    and getattr(req_state.parent_req.sampling_params,
+                                'smc_alpha', None) is not None
+                )
+                if is_smc_child and not req_state.smc_retained:
+                    req_state.smc_retained = True
+                    smc_retaining = True
 
-                if req_state.queue is not None:
-                    # AsyncLLM: put into queue for handling by generate().
-                    req_state.queue.put(request_output)
-                else:
-                    # LLMEngine: return list of RequestOutputs.
-                    request_outputs.append(request_output)
+            # 4) Create and handle RequestOutput objects.
+            if not smc_retaining:
+                if request_output := req_state.make_request_output(
+                    new_token_ids,
+                    pooling_output,
+                    finish_reason,
+                    stop_reason,
+                    kv_transfer_params,
+                    routed_experts,
+                    smc_log_weight,
+                ):
+                    if req_state.streaming_input:
+                        request_output.finished = False
+
+                    if req_state.queue is not None:
+                        # AsyncLLM: put into queue for handling by generate().
+                        req_state.queue.put(request_output)
+                    else:
+                        # LLMEngine: return list of RequestOutputs.
+                        request_outputs.append(request_output)
 
             # Free completed requests.
             if finish_reason is not None:
-                #if req_state.detokenizer is not None:
-                    #print(
-                    #    f"[SMC_DBG] FINISH req={req_id} "
-                    #    f"token_ids_len={len(req_state.detokenizer.token_ids)} "
-                    #    f"output_token_ids_len={len(req_state.detokenizer.output_token_ids)} "
-                    #    f"finish={finish_reason}",
-                    #    flush=True,
-                    #)
                 if req_state.streaming_input:
                     if req_state.input_chunk_queue:
                         update = req_state.input_chunk_queue.popleft()
                         req_state.apply_streaming_update(update)
                     else:
                         req_state.input_chunk_queue = None
-                else:
+                elif not smc_retaining:
                     self._finish_request(req_state)
                     if not engine_core_output.finished:
-                        # If req not finished in EngineCore, but Detokenizer
-                        # detected stop string, abort needed in EngineCore.
+                        # If req not finished in EngineCore, but
+                        # Detokenizer detected stop string, abort
+                        # needed in EngineCore.
                         reqs_to_abort.append(req_id)
 
                     # Track per-request stats
@@ -709,12 +714,41 @@ class OutputProcessor:
                         req_state, finish_reason, iteration_stats
                     )
                     if self.tracing_enabled:
-                        self.do_tracing(engine_core_output, req_state, iteration_stats)
+                        self.do_tracing(engine_core_output, req_state,
+                                        iteration_stats)
 
         return OutputProcessorOutput(
             request_outputs=request_outputs,
             reqs_to_abort=reqs_to_abort,
         )
+
+    def release_smc_retained(
+        self, release_ids: list[str],
+    ) -> list[RequestOutput | PoolingRequestOutput]:
+        """Clean up retained SMC request states that will never be replaced.
+
+        Emits final aggregated outputs for any parent requests that become
+        complete as a result of the release.
+        """
+        request_outputs: list[RequestOutput | PoolingRequestOutput] = []
+        for req_id in release_ids:
+            req_state = self.request_states.get(req_id)
+            if req_state is None or not req_state.smc_retained:
+                continue
+            req_state.smc_retained = False
+            # Emit the child's final output via the parent aggregator.
+            if request_output := req_state.make_request_output(
+                new_token_ids=[],
+                pooling_output=None,
+                finish_reason=FinishReason.LENGTH,
+                stop_reason=None,
+            ):
+                if req_state.queue is not None:
+                    req_state.queue.put(request_output)
+                else:
+                    request_outputs.append(request_output)
+            self._finish_request(req_state)
+        return request_outputs
 
     def _finish_request(self, req_state: RequestState) -> None:
         req_id = req_state.request_id
