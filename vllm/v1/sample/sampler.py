@@ -2,6 +2,8 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """A layer that samples the next tokens from the model's outputs."""
 
+import warnings
+
 import torch
 import torch.nn as nn
 
@@ -64,6 +66,8 @@ class Sampler(nn.Module):
         self.pin_memory = is_pin_memory_available()
         self.logprobs_mode = logprobs_mode
 
+        self._prefix_logprobs: torch.Tensor | None = None
+
     def forward(
         self,
         logits: torch.Tensor,
@@ -72,6 +76,12 @@ class Sampler(nn.Module):
         logprobs_mode_override: LogprobsMode | None = None,
     ) -> SamplerOutput:
         logprobs_mode = logprobs_mode_override or self.logprobs_mode
+        smc_is_active = sampling_metadata.smc_alphas is not None
+        if smc_is_active:
+            # In SMC we use the logits directly. These are not processed through topK 
+            # nor topP. This can be changed, but it requires changes to the code below.
+            raw_logits = logits.clone().to(torch.float32)
+
         # NOTE(woosuk): Use the original logits (before any penalties or
         # temperature scaling) for the top-k logprobs.
         # This is different from the V0 sampler, which uses the logits that
@@ -89,14 +99,28 @@ class Sampler(nn.Module):
         # Use float32 for the logits.
         logits = logits.to(torch.float32)
 
-        # Compute SMC incremental log-weights (on raw float32 logits, before penalties)
-        smc_log_weights = self._compute_smc_weights(logits, sampling_metadata)
-
         logits = self.apply_logits_processors(
             logits, sampling_metadata, predict_bonus_token
         )
+
+        # With SMC, we force set the temperature to 1/alpha.
+        # We temporarily modify the sampling_metadata.temperature here, and reset it
+        # back to the original value after sampling.
+        if smc_is_active:
+            smc_alpha = self._get_smc_alpha(sampling_metadata)
+            _previous_temp = sampling_metadata.temperature
+            if sampling_metadata.temperature is not None:
+                warnings.warn(f"{sampling_metadata.temperature=} is not None, but SMC is active. Temperature will be overriden for SMC requests.")  # TODO: use logging.warning
+            temp = 1 / smc_alpha
+            sampling_metadata.temperature = temp.to(device=logits.device) 
+        
         # Sample the next token.
         sampled, processed_logprobs = self.sample(logits, sampling_metadata)
+
+        # If SMC modified the temperature, reset temperature to the user-specified value.
+        if smc_is_active:
+            sampling_metadata.temperature = _previous_temp
+        
         if processed_logprobs is not None:
             raw_logprobs = processed_logprobs
         # Convert sampled token ids to int64 (long) type to ensure compatibility
@@ -117,6 +141,14 @@ class Sampler(nn.Module):
             logprobs_tensors = self.gather_logprobs(
                 raw_logprobs, num_logprobs, token_ids=sampled
             )
+
+        # Compute SMC incremental log-weights
+        if smc_is_active:
+            # TODO: we may want to include the topK and topP processing in the SMC weights computation, leaving for future work
+            # raw_logits with no temperature, topK or topP applied.
+            smc_log_weights = self._compute_smc_weights(raw_logits, sampled, sampling_metadata)   
+        else:
+            smc_log_weights = None
 
         # Use int32 to reduce the tensor size.
         sampled = sampled.to(torch.int32)
@@ -211,36 +243,86 @@ class Sampler(nn.Module):
         return logits.log_softmax(dim=-1, dtype=torch.float32)
 
     @staticmethod
+    def _get_smc_alpha(sampling_metadata: SamplingMetadata, previous: bool = False) -> torch.Tensor:
+        """Get the SMC alpha for each request, applying ramp up if specified.
+        
+        Returns a tuple of tensors:
+        - alpha_t: the SMC alpha to be applied at the current step for each request, 
+          after applying ramp up if specified. Shape: [num_reqs]
+        - ramp_mask: a boolean tensor indicating which requests are currently in the 
+          ramp up phase. Shape: [num_reqs]
+
+        If previous=True, returns the alpha and ramp mask for the previous step.
+        """
+        assert sampling_metadata.smc_alphas is not None, "SMC alphas must not be None to compute SMC log weights"
+        smc_alphas = sampling_metadata.smc_alphas
+        device = smc_alphas.device
+        alpha_t = smc_alphas.to(dtype=torch.float32)
+        # Apply α ramp: alpha_eff = min(alpha, 1.0 + (alpha-1.0) * step/ramp_tokens)
+        if (
+            sampling_metadata.smc_alpha_ramp_tokens is not None 
+            and sampling_metadata.smc_step_counts is not None
+        ):
+            ramp = sampling_metadata.smc_alpha_ramp_tokens.to(dtype=torch.float32, device=device)
+            apply_ramp_mask = ramp > 0
+            
+            steps = sampling_metadata.smc_step_counts.to(dtype=torch.float32, device=device)
+            if previous:
+                steps = steps - 1.0  # get the step count for the previous step
+
+            ramped = 1.0 + (alpha_t - 1.0) * (steps + 1.0) / ramp.clamp(min=1.0)  # TODO: why steps + 1? at step 0 it should be ramped=1, at step "ramp" is shuold be ramped=alpha
+            alpha_t = torch.where(apply_ramp_mask, torch.minimum(alpha_t, ramped), alpha_t)
+        return alpha_t
+
+
+    # TODO: there are many different errors here:
+    # - the log_p is computed on the whole vocabulary, but the SMC weight should only be computed on the sampled token. Consequently, the formula in the docstring doesn't seem correct.
+    # - there is not correction of the weights during ramp up when alpha changes, See sec 5.3
+    # - the proposal distribution q is not considered in the formula or implementation, see line 10 in Algorithm 1 in the paper.
+    # 
+    # REMARK: notice that these are the UPDATES for the weights, not the weights themselves. 
+    # The accumulation is done at SMCController.accumulate, which simply does log_w += update 
+    # where the update is the output of _compute_smc_weights. This means that any correction during ramp up needs to
+    # be done here as well, which means there is another mistake:
+    # - there is no ramp up correction in the weights updates, see sec 5.3 in the paper. 
+    #   Notice that to fix this we need to keep in memory the ENTIRE log_p(y_1:t) of the 
+    #   prefix and update that. Is it done anywhere? And if so, is it updated during resampling?
     def _compute_smc_weights(
+        self,
         logits: torch.Tensor,
+        sampled_indices: torch.Tensor,
         sampling_metadata: SamplingMetadata,
     ) -> torch.Tensor | None:
+        # TODO: change docstring, explain the meaning and shapes of the inputs
         """Compute incremental SMC log-weight per request.
 
         log_w_t = logsumexp(α · log_softmax(logits), dim=-1) for SMC requests,
         0.0 for non-SMC requests.
         Returns None if no request has SMC enabled.
         """
-        smc_alphas = sampling_metadata.smc_alphas
-        if smc_alphas is None:
-            return None
-        # smc_alphas is a CPU tensor; move to same device as logits
-        alpha_t = smc_alphas.to(device=logits.device, dtype=torch.float32)
-        # Apply α ramp: alpha_eff = min(alpha, 1.0 + (alpha-1.0) * step/ramp_tokens)
-        if (sampling_metadata.smc_alpha_ramp_tokens is not None
-                and sampling_metadata.smc_step_counts is not None):
-            ramp = sampling_metadata.smc_alpha_ramp_tokens.to(
-                device=logits.device, dtype=torch.float32
-            )
-            steps = sampling_metadata.smc_step_counts.to(
-                device=logits.device, dtype=torch.float32
-            )
-            ramp_mask = ramp > 0
-            ramped = 1.0 + (alpha_t - 1.0) * (steps + 1.0) / ramp.clamp(min=1.0)
-            alpha_t = torch.where(ramp_mask, torch.minimum(alpha_t, ramped), alpha_t)
-        log_p = logits.log_softmax(dim=-1)  # [num_reqs, vocab]
+        alpha_t = self._get_smc_alpha(sampling_metadata)
+        alpha_t_prev = self._get_smc_alpha(sampling_metadata, previous=True)
+        
         # α · log_p, then logsumexp over vocab → scalar per request
-        log_w = torch.logsumexp(alpha_t.unsqueeze(1) * log_p, dim=-1)  # [num_reqs]
+        # See the expression for ω_t in Theorem 1 of the paper.
+        log_p = logits.log_softmax(dim=-1)  # [num_reqs, vocab]
+        log_w = torch.logsumexp(alpha_t.unsqueeze(1) * log_p, dim=-1)  # [num_reqs]  # TODO: incorrect! the log w refers only to the SAMPLED token, not the whole vocabulary. Also, here we have log p, but where is log q?
+
+        # Since we use a continuous linear strategy, we also need to rescale the weights
+        # via the prefix cumulative probability, see Sec 5.3 of the paper.
+        # Only perform this correction when:
+        # - alpha changes due to ramp up
+        # - and when alpha > 1 (i.e. from the second step of SMC onwards)
+        update_mask = (alpha_t > 1.0) & (alpha_t != alpha_t_prev)
+        # We first accumulate the log_p of the sampled tokens in the prefix, 
+        # so to keep an updated log p(y_1:t) for each request.
+        if self._prefix_logprobs is None:
+            self._prefix_logprobs = torch.zeros_like(log_w)  
+        sampled_log_p = log_p.gather(1, sampled_indices.unsqueeze(1)).squeeze(1)  # [num_reqs]
+        self._prefix_logprobs = self._prefix_logprobs + sampled_log_p
+
+        log_w = log_w + torch.where(update_mask, (alpha_t - alpha_t_prev) * self._prefix_logprobs, 0.0)
+
         # Zero out non-SMC requests
         log_w = log_w * (alpha_t > 0).float()
         return log_w
