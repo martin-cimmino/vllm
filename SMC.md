@@ -1,4 +1,4 @@
-# CLAUDE.md
+# SMC.md
 
 This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
 
@@ -102,14 +102,13 @@ pytest tests/v1/sample/test_smc_sampler.py tests/v1/engine/test_smc_e2e.py -v
 pytest tests/v1/sample/test_smc_*.py tests/v1/engine/test_smc_*.py -v
 ```
 
-**Last known status (2026-03-18):**
+**Last known status (2026-03-20):**
 - No-GPU suite (44 tests): **all pass**.
   - `test_smc_sampling_params.py` (11): all pass.
-  - `test_smc_controller.py` (33): all pass — covers ESS, systematic resampling, register/accumulate/unregister lifecycle, `ResampleAction` construction, winner preservation, ID chaining, `max_tokens` adjustment, budget exhaustion, zombie-inclusive ESS trigger (`test_zombie_inclusive_ess_trigger`), zombie-exclusive resampling pool (`test_zombie_ancestor_does_not_win_active_slots`), active-only weight reset (`test_weights_reset_active_only_after_resample_with_zombie`), proxy-ancestor assertions (`test_maybe_resample_losers_identified_correctly`), and lifecycle/Phase 3 field tests.
+  - `test_smc_controller.py` (33): all pass — covers ESS, systematic resampling, register/accumulate/unregister lifecycle, `ResampleAction` construction, winner preservation, ID chaining, `max_tokens` adjustment, budget exhaustion, zombie-inclusive ESS trigger, frozen-loser revival with NewParticle creation, proxy-ancestor assertions, and lifecycle/Phase 3 field tests.
 - GPU sampler suite (`test_smc_sampler.py`): not re-run after Phase 4 alpha-ramp fix (minor).
 - GPU e2e suite (`test_smc_e2e.py`): not re-run after bug fixes — awaiting GPU node. Set `SMC_TEST_MODEL` env var.
-- `smc_benchmark_v4.py`: validated 2026-03-13 (pre-zombie-ESS and pre-abort-after-create fix). **Re-run needed** to validate current state.
-- `ruff check vllm/`: clean on all SMC-modified files.
+- `smc_benchmark_v4.py`: validated 2026-03-20 — frozen-loser revival and retained-state mechanism working end-to-end.
 
 ---
 
@@ -131,59 +130,120 @@ vLLM has two engine versions. **This project targets V1 exclusively.**
 | `vllm/v1/sample/sampler.py` | `Sampler._compute_smc_weights` — computes `logsumexp(α * log_softmax(logits))` in-GPU |
 | `vllm/v1/outputs.py` | `SamplerOutput`, `ModelRunnerOutput` — `smc_log_weights` field |
 | `vllm/v1/engine/smc_controller.py` | `SMCController` — accumulates weights, resamples, tracks ID remapping |
-| `vllm/v1/engine/core.py` | `EngineCore` — SMC auto-registration, resampling wiring, output ID remapping |
-| `vllm/v1/engine/__init__.py` | `EngineCoreOutput` — `smc_log_weight`, `smc_detokenizer_reset` fields |
-| `vllm/v1/engine/output_processor.py` | Detokenizer reset on resampled outputs |
+| `vllm/v1/engine/core.py` | `EngineCore` — SMC auto-registration, resampling wiring, output ID remapping, `_smc_check_done_groups()` |
+| `vllm/v1/engine/__init__.py` | `EngineCoreOutput` — `smc_log_weight`, `smc_detokenizer_reset`; `EngineCoreOutputs` — `smc_release_ids` |
+| `vllm/v1/engine/output_processor.py` | Detokenizer reset, `smc_retained` state retention, `release_smc_retained()` |
+| `vllm/v1/engine/llm_engine.py` | `LLMEngine.step()` — processes `smc_release_ids` after output processing |
 | `vllm/v1/request.py` | `Request`, `RequestStatus` |
 | `vllm/outputs.py` | `CompletionOutput` — `smc_log_weight` field for API response |
 | `vllm/entrypoints/openai/completion/protocol.py` | `CompletionResponseChoice` — `smc_log_weight` field |
 
 ### SMC Data Flow (V1)
 
+Three layers participate in each step:
+
 ```
-EngineCore.step()
-  → schedule()
-  → execute_model()
-      Sampler: logsumexp(α * log_softmax(logits)) per SMC request
-      → SamplerOutput.smc_log_weights: dict[req_id, float]
-  → SMCController.accumulate(smc_log_weights)
-  → update _smc_token_snapshot for all active SMC particles
-  → SMCController.maybe_resample(scheduler.requests, token_snapshots)
-      freeze newly finished slots (zombie); save token_ids to zombie_token_ids
-      compute ESS over ALL N weights (zombie-inclusive)
-      if ESS < threshold AND active > 0:
-        → systematic resample over ACTIVE slots only
-        → each loser slot → NewParticle with direct ancestor (proxy OK)
-        → return ResampleAction(loser_request_ids, new_particles)
-        → reset ACTIVE weights to 0; zombie frozen_weights preserved
-  → EngineCore._apply_resample_actions(actions)
-      → Request(prompt=ancestor.all_token_ids) → add_request()  # FIRST
-        (prefix cache auto-hits ancestor's KV blocks — zero-copy reuse)
-      → abort_requests(loser_ids)                                # THEN
-        (abort-after-create: proxy ancestors still alive when cloned)
-  → scheduler.update_from_output()
-  → _smc_remap_outputs()
-      → rewrite internal SMC IDs → original external child IDs
-      → set smc_detokenizer_reset=True on first output of each replacement
-  → OutputProcessor: clear detokenizer state on reset outputs
+┌─────────────────────────────────────────────────────────────────────┐
+│ LLMEngine.step()                                                    │
+│   1. engine_core.get_output() → EngineCoreOutputs                   │
+│   2. output_processor.process_outputs(outputs)                      │
+│      • detokenize, build RequestOutput per child                    │
+│      • SMC child finishes → smc_retained=True, skip output emission │
+│      • smc_detokenizer_reset → reset detokenizer, clear retained    │
+│   3. release_smc_retained(smc_release_ids)                          │
+│      • emit final aggregated RequestOutput for never-replaced slots │
+│   4. engine_core.abort_requests(reqs_to_abort)                      │
+└─────────────────────────────────────────────────────────────────────┘
+
+┌─────────────────────────────────────────────────────────────────────┐
+│ EngineCore.step()                                                   │
+│                                                                     │
+│   ┌─ Scheduler ─────────────────────────────────────────────┐       │
+│   │  schedule() → SchedulerOutput                           │       │
+│   └─────────────────────────────────────────────────────────┘       │
+│                         ↓                                           │
+│   ┌─ ModelExecutor / Sampler ───────────────────────────────┐       │
+│   │  execute_model() → ModelRunnerOutput                    │       │
+│   │  Sampler._compute_smc_weights():                        │       │
+│   │    logsumexp(α · log_softmax(logits)) per SMC request   │       │
+│   │    → smc_log_weights: dict[req_id, float]               │       │
+│   └─────────────────────────────────────────────────────────┘       │
+│                         ↓                                           │
+│   ┌─ SMCController ────────────────────────────────────────────┐    │
+│   │  _smc_auto_register_from_weights()                         │    │
+│   │    lazy group registration on first step                   │    │
+│   │                                                            │    │
+│   │  accumulate(smc_log_weights)                               │    │
+│   │    add incremental weights (skip frozen slots)             │    │
+│   │                                                            │    │
+│   │  maybe_resample(scheduler.requests)                        │    │
+│   │    1. freeze newly finished slots (missing from requests)  │    │
+│   │    2. compute ESS over ALL N weights (frozen-inclusive)     │    │
+│   │    3. if ESS < threshold AND any active slot:              │    │
+│   │       systematic_resample(log_weights) → ancestors[N]      │    │
+│   │       classify each loser slot (see Resampling Outcomes)   │    │
+│   │       → ResampleAction(loser_req_ids, new_particles)       │    │
+│   │       reset non-frozen weights to 0                        │    │
+│   └────────────────────────────────────────────────────────────┘    │
+│                         ↓                                           │
+│   ┌─ EngineCore._apply_resample_actions() ─────────────────┐       │
+│   │  for each NewParticle:                                  │       │
+│   │    scheduler.add_request(prompt=ancestor.all_token_ids) │ FIRST │
+│   │    (prefix cache auto-hits ancestor KV blocks)          │       │
+│   │  abort_requests(loser_ids)                              │ THEN  │
+│   │    (abort-after-create: proxy ancestors still alive)     │       │
+│   └─────────────────────────────────────────────────────────┘       │
+│                         ↓                                           │
+│   ┌─ Scheduler ─────────────────────────────────────────────┐       │
+│   │  update_from_output() → EngineCoreOutputs               │       │
+│   └─────────────────────────────────────────────────────────┘       │
+│                         ↓                                           │
+│   _smc_remap_outputs()                                              │
+│     rewrite internal smc_* IDs → original child IDs                 │
+│     set smc_detokenizer_reset=True on first output per replacement   │
+│     attach smc_winner_token_ids for detokenizer reset               │
+│                         ↓                                           │
+│   _smc_check_done_groups()                                          │
+│     if all children left scheduler → smc_release_ids                │
+│     in EngineCoreOutputs, unregister group                          │
+└─────────────────────────────────────────────────────────────────────┘
 ```
+
+### Resampling Outcomes (4 cases)
+
+When `systematic_resample` assigns `ancestors[slot] ≠ slot` (slot is a loser), the outcome depends on the ancestor and loser states:
+
+| # | Loser | Ancestor | Action | Abort? | New request? |
+|---|---|---|---|---|---|
+| 1 | Active | Frozen | Loser inherits frozen weight, becomes frozen. Orphaned request runs to natural completion. | No | No |
+| 2 | Active | Active (budget exhausted) | Same as #1: loser frozen in place with its current weight. | No | No |
+| 3 | Active | Active (has budget) | Loser aborted, replacement `NewParticle` created from ancestor's tokens. | Yes | Yes |
+| 4 | Frozen | Active (has budget) | Slot de-frozen, replacement `NewParticle` created. Original `RequestState` retained in output processor (`smc_retained=True`). | Yes* | Yes |
+
+*Case 4 abort: the frozen loser's original request already left the scheduler (finished naturally), so `finish_requests` safely skips it. The abort is a no-op for the scheduler but keeps the `loser_request_ids` list uniform.
+
+**Why active losers are NOT aborted in cases 1-2:** aborting without a replacement would reduce the number of live scheduler slots below N, causing the engine to stall. Instead, the orphaned request runs to completion while `accumulate()` skips weight updates for its frozen slot.
 
 ### Key Design Decisions
 
-**Zombie-inclusive ESS trigger, active-only resampling pool:**
-- ESS is computed over all N weights (including frozen zombie weights). As active particles accumulate negative incremental weights while zombie weights stay frozen, zombie weights dominate → ESS collapses → resampling fires.
-- Resampling draws winners from **active slots only**. Zombies have no live KV state and cannot be resumed as new vLLM requests.
-- After resample: active slot weights reset to 0; zombie `frozen_weights` preserved for `get_final_weights()` voting.
+**Zombie-inclusive ESS trigger:**
+ESS is computed over all N weights (including frozen zombie weights). As active particles accumulate negative incremental weights while zombie weights stay frozen, zombie weights dominate → ESS collapses → resampling fires. After resample: non-frozen weights reset to 0; `frozen_weights` preserved for `get_final_weights()` voting.
+
+**Accumulate guard for frozen slots:**
+`accumulate()` skips weight updates for slots in `frozen_weights`. This prevents orphaned active requests (from frozen-ancestor or budget-exhausted wins) from inflating their fixed weights with incremental updates. `frozen_weights` is the single source of truth for finished/inherited slots.
 
 **Proxy ancestors (abort-after-create):**
 `systematic_resample` can assign a slot k as ancestor for slot j, while k itself is also a loser. In `_apply_resample_actions()`, new requests are created **before** losers are aborted, so proxy ancestors are still alive in the scheduler when their `all_token_ids` are read. No chain-following needed in `smc_controller.py` — direct ancestors are always valid at creation time.
 
+**Retained RequestState for frozen-loser revival:**
+When an SMC child finishes naturally, the output processor sets `smc_retained=True` instead of calling `_finish_request()`. This keeps the `RequestState` alive in `request_states` so that if a replacement particle is later created (frozen loser revived by active ancestor), the replacement's remapped output finds the state and can reset the detokenizer. Retained children skip `make_request_output()` on finish — their output is suppressed until either (a) a replacement finishes and emits the real output, or (b) `release_smc_retained()` is called when the group is fully done. The `smc_release_ids` field in `EngineCoreOutputs` carries original child IDs from `_smc_check_done_groups()` (detected when all children leave the scheduler). `LLMEngine.step()` calls `release_smc_retained()` after `process_outputs()`, which emits the final aggregated `RequestOutput` for never-replaced retained states.
+
 **Detokenizer reset (once per replacement):**
-`smc_detokenizer_reset=True` is set only on the **first output** of each replacement particle (tracked via `_smc_new_particle_ids: set[str]`). Setting it on every output would clear the detokenizer each step, leaving only the last token in the final output.
+`smc_detokenizer_reset=True` is set only on the **first output** of each replacement particle (tracked via `_smc_new_particle_ids: set[str]`). Setting it on every output would clear the detokenizer each step, leaving only the last token in the final output. The reset also clears `smc_retained=False` on the target `RequestState`.
 
 ### Child Request ID Convention
 
-SMC child requests: `"{index}_{parent_id}"` — e.g. `"0_req-abc"`, `"1_req-abc"` (set by `ParallelSamplingProcessor.get_child_info()`).
+SMC child requests: `"{index}_{parent_id}"` — e.g. `"0_req-abc"`, `"1_req-abc"` (set by `ParentRequest.get_child_info()`).
 
 Resampled replacement requests: `"smc_{parent_id}_{step_count}_{slot_index}"` — e.g. `"smc_req-abc_5_2"`.
 
@@ -205,6 +265,8 @@ Resampled replacement requests: `"smc_{parent_id}_{step_count}_{slot_index}"` �
 ### Running benchmarks
 
 ```bash
+VLLM_LOGGING_LEVEL=DEBUG
+
 # smc_benchmark_v4 — single problem with baseline comparison:
 python smc_benchmark_v4.py \
     --model /leonardo_scratch/fast/AIFAC_L13_018/models/Domyn-Small-v0.2-bf16 \
@@ -257,7 +319,7 @@ Engine weight ≤ logprob weight (more negative). Rank correlation typically >0.
 | Weighted vote | -6 ✗ | -12 ✓ |
 | Wall clock | 54.7s | 46.0s |
 
-Notable: weighted vote correctly identifies the minority correct answer (-12) via SNIS. **Re-run needed** after zombie-inclusive ESS and abort-after-create fixes — expect more resampling events and no hang.
+Notable: weighted vote correctly identifies the minority correct answer (-12) via SNIS. Re-validated 2026-03-20 with all fixes (zombie-inclusive ESS, abort-after-create, frozen-loser revival with retained states).
 
 ---
 
@@ -266,15 +328,17 @@ Notable: weighted vote correctly identifies the minority correct answer (-12) vi
 ### Phases 1–3 — COMPLETE
 
 - **Phase 1**: `SamplingParams` SMC fields; `Sampler._compute_smc_weights` in-GPU; `smc_log_weights` in `SamplerOutput`/`ModelRunnerOutput`; `SMCController` (accumulate, ESS, systematic resample).
-- **Phase 2**: Mid-generation resampling wired end-to-end. `ResampleAction`/`NewParticle`/`ZombieClone` dataclasses; `_apply_resample_actions()` in `core.py`; ID remapping; detokenizer reset (once per replacement).
+- **Phase 2**: Mid-generation resampling wired end-to-end. `ResampleAction`/`NewParticle` dataclasses; `_apply_resample_actions()` in `core.py`; ID remapping; detokenizer reset (once per replacement).
 - **Phase 3**: `smc_log_weight` exposed through `CompletionOutput`, `EngineCoreOutput`, `CompletionResponseChoice`.
 
 **Bugs fixed (all resolved):**
 - `ValueError: SMC requires n > 1` during `SamplingParams.clone()`: removed `n<=1` guard from `_verify_args()` since child requests legitimately have `n=1` with `smc_alpha` set.
 - Replacement particles producing only 1 output token: `smc_detokenizer_reset=True` was firing every decode step. Fixed via `_smc_new_particle_ids` set in `EngineCore`.
 - Proxy-ancestor hang: `systematic_resample` assigns proxy ancestors (slots that are themselves losers). Fixed by creating new requests **before** aborting losers in `_apply_resample_actions()` (abort-after-create), so proxy ancestors are still alive when cloned. No chain-following needed.
+- Dangling slot on budget exhaustion: `remaining <= 0` skip created a new ID and aborted the loser but never created the replacement request. Fixed by checking budget **before** abort/ID assignment; exhausted slots are frozen in place.
+- Frozen-loser revival output silently dropped: when a frozen loser was revived by an active ancestor, the replacement particle's output was dropped because `_finish_request()` had already removed the original child's `RequestState`. Fixed by retaining SMC child states on finish (`smc_retained=True`), skipping output emission for retained children, and adding `smc_release_ids` in `EngineCoreOutputs` + `release_smc_retained()` for cleanup when all particles are done.
 
-### Phase 4 — IN PROGRESS (2026-03-18)
+### Phase 4 — IN PROGRESS (2026-03-20)
 
 **Completed:**
 - `smc_benchmark_v5.py` + SLURM wrapper: full AIME 2025 benchmark with aggregate metrics.
@@ -282,11 +346,16 @@ Notable: weighted vote correctly identifies the minority correct answer (-12) vi
 - Zombie-inclusive ESS trigger: `compute_ess(group.log_weights)` (all N) instead of active-only.
 - Abort-after-create in `_apply_resample_actions()`: eliminates proxy-ancestor hang.
 - `test_smc_controller.py` aligned with current behavior (33 tests, all pass): proxy-ancestor assertions in `test_maybe_resample_losers_identified_correctly`; renamed `test_zombie_inclusive_ess_trigger`.
+- **No-abort for frozen-ancestor wins**: active losers whose ancestor is frozen (or budget-exhausted) are not aborted — scheduler requires N slots to stay alive. Slot is frozen, `accumulate()` guard suppresses weight updates, orphaned request runs to natural completion.
+- **Budget-exhaustion freeze**: when an active ancestor has `remaining <= 0` tokens, the loser slot is frozen in place (no abort, no replacement) — prevents dangling slot IDs.
+- `maybe_resample` cleanup: replaced `print()` with `logger.debug()`, removed dead code/breakpoints, sequential step numbering, restructured loser loop (budget check before abort/ID assignment).
+- **Frozen-loser revival**: frozen losers with active ancestors are de-frozen and get real replacement particles (instead of just inheriting the ancestor's weight). The output processor retains SMC child `RequestState` on finish (`smc_retained=True`) so replacement outputs find the state alive. `_smc_check_done_groups()` in `EngineCore` detects fully-done groups and sends `smc_release_ids` via `EngineCoreOutputs` to release never-replaced retained states with their final aggregated output.
+- Removed all `[SMC_DIAG]`/`[SMC_DBG]` diagnostic prints from `core.py`, `scheduler.py`, `output_processor.py`; converted useful ones to `logger.debug()`.
+- `smc_benchmark_v4.py` validated 2026-03-20 — all fixes working end-to-end.
 
 **Pending:**
-1. **Re-run `smc_benchmark_v4.py`** to validate all fixes end-to-end (zombie-inclusive ESS + abort-after-create). Expect more resampling events, all N particles finish cleanly, correct weighted vote.
-2. **Run full AIME 2025 benchmark**: `sbatch run_smc_benchmark_v5.sbatch -- --method both --n_particles 16 --alpha 2.0 --ess_threshold 0.5`.
-3. **Re-run GPU tests** (`test_smc_e2e.py`) on a compute node.
+1. **Run full AIME 2025 benchmark**: `sbatch run_smc_benchmark_v5.sbatch -- --method both --n_particles 16 --alpha 2.0 --ess_threshold 0.5`.
+2. **Re-run GPU tests** (`test_smc_e2e.py`) on a compute node.
 
 ---
 
@@ -309,6 +378,12 @@ New requests start with `priority=0, status=WAITING`. Irrelevant for single-requ
 
 ### 6. CUDA graph compatibility
 `_apply_resample_actions()` calls `scheduler.add_request()` during the forward pass. May require disabling CUDA graphs for SMC requests.
+
+### 7. `smc_release_ids` in AsyncLLM path untested
+`release_smc_retained()` is called in `LLMEngine.step()`. The `AsyncLLM` path uses a queue-based output model and may need analogous release handling. Only single-process `LLMEngine` has been validated.
+
+### 8. Retained SMC states and stats/tracing
+Retained SMC children skip `_update_stats_from_finished()` and `do_tracing()` on their original finish. Stats and traces are only emitted when the replacement finishes or when `release_smc_retained()` runs (which does not emit stats). This means retained-then-released children have no finish stats recorded.
 
 ---
 

@@ -403,8 +403,8 @@ def test_freezes_finished_particle_and_resamples_active() -> None:
     assert "p1" in actions
     action = actions["p1"]
 
-    # Active losers c1, c2 are aborted (frozen loser c3 has no live request).
-    assert set(action.loser_request_ids) == {"c1", "c2"}
+    # All three losers (c1, c2 active + c3 frozen-revived) are aborted.
+    assert set(action.loser_request_ids) == {"c1", "c2", "c3"}
 
     # All three loser slots (1, 2, 3) get new particles from active winner c0.
     # Frozen slot 3 is revived by the active ancestor.

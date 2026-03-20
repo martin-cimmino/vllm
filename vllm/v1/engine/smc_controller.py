@@ -25,7 +25,7 @@ class NewParticle:
 class ResampleAction:
     """Structured output from a resampling event."""
 
-    loser_request_ids: list[str]  # active-slot IDs to abort
+    loser_request_ids: list[str]  # IDs to abort (active + revived frozen)
     new_particles: list[NewParticle]  # replacement live requests to create
 
 
@@ -261,7 +261,7 @@ class SMCController:
             # 6. Build NewParticles for loser slots.
             # Proxy ancestors are valid because new requests are created before
             # losers are aborted (abort-after-create in core.py).
-            active_loser_req_ids: list[str] = []
+            loser_req_ids: list[str] = []
             new_particles: list[NewParticle] = []
             new_child_ids: list[str] = list(group.child_request_ids)
             frozen_weights_to_remove: list[int] = []
@@ -315,14 +315,22 @@ class SMCController:
                         slot_idx, anc_idx, anc_max_tokens, num_output)
                     continue
 
-                # --- Safe to abort loser and create replacement. ---
-                if slot_idx not in frozen_before_resample:
-                    active_loser_req_ids.append(
-                        group.child_request_ids[slot_idx]
-                    )
-                else:
-                    # Frozen loser revived by an active winner.
+                # --- Frozen loser revived by active ancestor: de-freeze
+                # the slot and create a replacement particle.  The
+                # output processor retains SMC child request states on
+                # finish (smc_retained=True), so the replacement's
+                # remapped output will find the RequestState alive. ---
+                if slot_idx in frozen_before_resample:
                     frozen_weights_to_remove.append(slot_idx)
+                    logger.debug(
+                        "Slot %d: frozen loser revived by active "
+                        "ancestor %d, de-freezing and creating "
+                        "replacement", slot_idx, anc_idx)
+
+                # --- Active or revived loser: create replacement. ---
+                loser_req_ids.append(
+                    group.child_request_ids[slot_idx]
+                )
 
                 new_id = f"smc_{pid}_{group.step_count}_{slot_idx}"
                 original_child = self.get_original_id(
@@ -344,10 +352,10 @@ class SMCController:
             for slot_idx in frozen_weights_to_remove:
                 del group.frozen_weights[slot_idx]
 
-            logger.debug("Loser request IDs: %s", active_loser_req_ids)
+            logger.debug("Loser request IDs: %s", loser_req_ids)
 
             resample_actions[pid] = ResampleAction(
-                loser_request_ids=active_loser_req_ids,
+                loser_request_ids=loser_req_ids,
                 new_particles=new_particles,
             )
             logger.debug("Old child IDs: %s", group.child_request_ids)

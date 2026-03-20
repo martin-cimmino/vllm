@@ -232,6 +232,10 @@ class EngineCoreOutputs(
     # "old" wave, so the next wave needs to be started in other engines.
     start_wave: int | None = None
 
+    # SMC: original child IDs whose retained RequestStates should be
+    # released (group fully done, no more replacements coming).
+    smc_release_ids: list[str] | None = None
+
     def __post_init__(self):
         if self.timestamp == 0.0:
             self.timestamp = time.monotonic()
