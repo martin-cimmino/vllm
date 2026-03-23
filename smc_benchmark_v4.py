@@ -38,13 +38,12 @@ import argparse
 import json
 import math
 import os
+import random
 import re
 import time
 from collections import Counter
 from pathlib import Path
 from typing import Any
-
-import random
 
 import torch
 
@@ -202,25 +201,31 @@ class SMCInstrumentation:
         self._orig_maybe_resample = SMCController.maybe_resample
         instr = self
 
-        def patched_accumulate(ctrl_self, smc_log_weights: dict[str, float]) -> None:
+        def patched_accumulate(
+            ctrl_self, 
+            smc_log_weight_update: dict[str, float], 
+            smc_sampled_logprob: dict[str, float],
+            smc_alpha_diff: dict[str, float],
+        ) -> None:
             step_idx = len(instr.steps)
             instr._controller = ctrl_self  # capture on first call
-            for req_id, w in smc_log_weights.items():
+            for req_id, w in smc_log_weight_update.items():
                 instr._cum_weights[req_id] = instr._cum_weights.get(req_id, 0.0) + w
             # Call the original first so group.log_weights are already updated,
             # then compute ESS from the post-update weights.
-            result = instr._orig_accumulate(ctrl_self, smc_log_weights)
+            result = instr._orig_accumulate(
+                ctrl_self,
+                smc_log_weight_update,
+                smc_sampled_logprob,
+                smc_alpha_diff,
+            )
             group_ess: dict[str, float] = {}
             for pid, group in ctrl_self._groups.items():
-                active_weights = [
-                    lw for i, lw in enumerate(group.log_weights) if i not in group.frozen_weights
-                ]
-                #ess = ctrl_self.compute_ess(active_weights)
                 ess = ctrl_self.compute_ess(group.log_weights)
                 group_ess[pid] = ess
             instr.steps.append({
                 "step": step_idx,
-                "req_weights": dict(smc_log_weights),
+                "req_weights": dict(smc_log_weight_update),
                 "group_ess": group_ess,
             })
             return result

@@ -14,7 +14,8 @@ from vllm.v1.core.sched.output import SchedulerOutput
 
 if TYPE_CHECKING:
     from vllm.distributed.kv_events import KVConnectorKVEvents
-    from vllm.distributed.kv_transfer.kv_connector.v1.metrics import KVConnectorStats
+    from vllm.distributed.kv_transfer.kv_connector.v1.metrics import \
+        KVConnectorStats
 else:
     KVConnectorStats = object
     KVConnectorKVEvents = object
@@ -119,7 +120,9 @@ class SamplerOutput:
     # PLACEHOLDER_TOKEN_ID (-1 by default) is used for padding.
     sampled_token_ids: torch.Tensor
     logprobs_tensors: LogprobsTensors | None
-    smc_log_weights: torch.Tensor | None = None  # [num_reqs], float32
+    smc_log_weight_update: torch.Tensor | None = None  # [num_reqs]
+    smc_sampled_logprob: torch.Tensor | None = None  # [num_reqs]
+    smc_alpha_diff: torch.Tensor | None = None  # [num_reqs]
 
 
 T = TypeVar("T")
@@ -248,8 +251,13 @@ class ModelRunnerOutput:
     # information related to cudagraph execution
     cudagraph_stats: CUDAGraphStat | None = None
 
-    # req_id → incremental SMC log-weight for this step
-    smc_log_weights: dict[str, float] | None = None
+    # SMC-related quantities. Mapping req_id to
+    #    → incremental SMC log-weight for this step
+    #    → log-probability of the sampled token
+    #    → difference of SMC alphas during alpha-ramping: alpha_l - alpha_{l-1}
+    smc_log_weight_update: dict[str, float] | None = None
+    smc_sampled_logprob: dict[str, float] | None = None
+    smc_alpha_diff: dict[str, float] | None = None
 
 
 # ModelRunnerOutput wrapper for async scheduling.

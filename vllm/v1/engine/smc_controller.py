@@ -72,6 +72,7 @@ class SMCController:
             parent_request_id=parent_request_id,
             child_request_ids=list(child_request_ids),
             log_weights=[0.0] * n,
+            prefix_logprob=[0.0] * n,
             ess_threshold=ess_threshold,
             alpha=alpha,
             alpha_ramp_tokens=alpha_ramp_tokens,
@@ -98,8 +99,13 @@ class SMCController:
                 # active loser with frozen ancestor cannot be aborted so it is
                 # important to exclude frozen particles from accumulation to prevent
                 # their fixed weights from being incorrectly inflated by active incremental weights.
-                if req_id in smc_log_weights and i not in group.frozen_weights:
-                    group.log_weights[i] += smc_log_weights[req_id]
+                if req_id in smc_log_weight_update and i not in group.frozen_weights:
+                    # accumulate logprob of the prefix p(y_1:t | x) according to sec 5.3. of paper
+                    group.prefix_logprob[i] += sampled_logprob[req_id]
+                    # perform log-weight update according to line 10 in Algorithm 1 of paper
+                    group.log_weights[i] += smc_log_weight_update[req_id]
+                    # perform log-weight update according to sec 5.3. of paper
+                    group.log_weights[i] += alpha_diff[req_id] * group.prefix_logprob[i]
             group.step_count += 1
 
     @staticmethod
@@ -278,6 +284,9 @@ class SMCController:
                 anc_idx = ancestors[slot_idx]
                 if slot_idx == anc_idx:
                     continue  # Winner — stays in its slot.
+                    
+                # Store the prefix log prob of the ancestor in the group.
+                group.prefix_logprob[slot_idx] = group.prefix_logprob[anc_idx]
 
                 # --- Frozen ancestor: cannot clone (no live KV state). ---
                 # Loser inherits the ancestor's frozen weight and becomes

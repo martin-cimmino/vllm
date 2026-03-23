@@ -66,8 +66,6 @@ class Sampler(nn.Module):
         self.pin_memory = is_pin_memory_available()
         self.logprobs_mode = logprobs_mode
 
-        self._prefix_logprobs: torch.Tensor | None = None
-
     def forward(
         self,
         logits: torch.Tensor,
@@ -144,11 +142,9 @@ class Sampler(nn.Module):
 
         # Compute SMC incremental log-weights
         if smc_is_active:
-            # TODO: we may want to include the topK and topP processing in the SMC weights computation, leaving for future work
-            # raw_logits with no temperature, topK or topP applied.
-            smc_log_weights = self._compute_smc_weights(raw_logits, sampled, sampling_metadata)   
+            smc_log_weight_updates, sampled_log_p, alpha_diff = self._compute_smc_updates(raw_logits, sampled, sampling_metadata)   
         else:
-            smc_log_weights = None
+            smc_log_weight_updates, sampled_log_p, alpha_diff = None, None, None
 
         # Use int32 to reduce the tensor size.
         sampled = sampled.to(torch.int32)
@@ -160,7 +156,9 @@ class Sampler(nn.Module):
             # token per request.
             sampled_token_ids=sampled.unsqueeze(-1),
             logprobs_tensors=logprobs_tensors,
-            smc_log_weights=smc_log_weights,
+            smc_log_weight_update=smc_log_weight_updates,
+            smc_sampled_logprob=sampled_log_p,
+            smc_alpha_diff=alpha_diff,
         )
         return sampler_output
 
@@ -287,12 +285,12 @@ class Sampler(nn.Module):
     # - there is no ramp up correction in the weights updates, see sec 5.3 in the paper. 
     #   Notice that to fix this we need to keep in memory the ENTIRE log_p(y_1:t) of the 
     #   prefix and update that. Is it done anywhere? And if so, is it updated during resampling?
-    def _compute_smc_weights(
+    def _compute_smc_updates(
         self,
         logits: torch.Tensor,
         sampled_indices: torch.Tensor,
         sampling_metadata: SamplingMetadata,
-    ) -> torch.Tensor | None:
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         # TODO: change docstring, explain the meaning and shapes of the inputs
         """Compute incremental SMC log-weight per request.
 
@@ -300,32 +298,22 @@ class Sampler(nn.Module):
         0.0 for non-SMC requests.
         Returns None if no request has SMC enabled.
         """
-        alpha_t = self._get_smc_alpha(sampling_metadata)
-        alpha_t_prev = self._get_smc_alpha(sampling_metadata, previous=True)
-        
-        # α · log_p, then logsumexp over vocab → scalar per request
-        # See the expression for ω_t in Theorem 1 of the paper.
         log_p = logits.log_softmax(dim=-1)  # [num_reqs, vocab]
-        log_w = torch.logsumexp(alpha_t.unsqueeze(1) * log_p, dim=-1)  # [num_reqs]  # TODO: incorrect! the log w refers only to the SAMPLED token, not the whole vocabulary. Also, here we have log p, but where is log q?
+        alpha_t = self._get_smc_alpha(sampling_metadata)  # [num_reqs]
 
-        # Since we use a continuous linear strategy, we also need to rescale the weights
-        # via the prefix cumulative probability, see Sec 5.3 of the paper.
-        # Only perform this correction when:
-        # - alpha changes due to ramp up
-        # - and when alpha > 1 (i.e. from the second step of SMC onwards)
-        update_mask = (alpha_t > 1.0) & (alpha_t != alpha_t_prev)
-        # We first accumulate the log_p of the sampled tokens in the prefix, 
-        # so to keep an updated log p(y_1:t) for each request.
-        if self._prefix_logprobs is None:
-            self._prefix_logprobs = torch.zeros_like(log_w)  
-        sampled_log_p = log_p.gather(1, sampled_indices.unsqueeze(1)).squeeze(1)  # [num_reqs]
-        self._prefix_logprobs = self._prefix_logprobs + sampled_log_p
-
-        log_w = log_w + torch.where(update_mask, (alpha_t - alpha_t_prev) * self._prefix_logprobs, 0.0)
-
+        # log omega = α · log_p, then logsumexp over vocab → scalar per request
+        # See the expression for ω_t in Theorem 1 of the paper.
+        log_omega = torch.logsumexp(alpha_t.unsqueeze(1) * log_p, dim=-1)  # [num_reqs]
         # Zero out non-SMC requests
-        log_w = log_w * (alpha_t > 0).float()
-        return log_w
+        log_omega = log_omega * (alpha_t > 0).float()
+
+        sampled_log_p = log_p.gather(1, sampled_indices.unsqueeze(1)).squeeze(1)  # [num_reqs]
+        
+        # alpha_diff is 0.0 if there is no alpha ramping (alpha_t = alpha_t_prev)
+        alpha_t_prev = self._get_smc_alpha(sampling_metadata, previous=True)
+        alpha_diff = alpha_t - alpha_t_prev
+
+        return log_omega, sampled_log_p, alpha_diff
 
     @staticmethod
     def gather_logprobs(

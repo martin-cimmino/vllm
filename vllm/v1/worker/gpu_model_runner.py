@@ -24,76 +24,48 @@ import vllm.envs as envs
 from vllm.compilation.counter import compilation_counter
 from vllm.compilation.cuda_graph import CUDAGraphStat, CUDAGraphWrapper
 from vllm.compilation.monitor import set_cudagraph_capturing_enabled
-from vllm.config import (
-    CompilationMode,
-    CUDAGraphMode,
-    VllmConfig,
-    get_layers_from_vllm_config,
-    set_current_vllm_config,
-    update_config,
-)
+from vllm.config import (CompilationMode, CUDAGraphMode, VllmConfig,
+                         get_layers_from_vllm_config, set_current_vllm_config,
+                         update_config)
 from vllm.distributed.ec_transfer import get_ec_transfer, has_ec_transfer
 from vllm.distributed.eplb.eplb_state import EplbState
-from vllm.distributed.kv_transfer import get_kv_transfer_group, has_kv_transfer_group
+from vllm.distributed.kv_transfer import (get_kv_transfer_group,
+                                          has_kv_transfer_group)
 from vllm.distributed.kv_transfer.kv_connector.utils import copy_kv_blocks
 from vllm.distributed.parallel_state import (
-    get_dcp_group,
-    get_pp_group,
-    get_tp_group,
-    graph_capture,
-    is_global_first_rank,
-    prepare_communication_buffer_for_model,
-)
-from vllm.forward_context import (
-    BatchDescriptor,
-    set_forward_context,
-)
+    get_dcp_group, get_pp_group, get_tp_group, graph_capture,
+    is_global_first_rank, prepare_communication_buffer_for_model)
+from vllm.forward_context import BatchDescriptor, set_forward_context
 from vllm.logger import init_logger
 from vllm.lora.layers import LoRAMapping, LoRAMappingType
 from vllm.model_executor.layers.attention import Attention, MLAAttention
 from vllm.model_executor.layers.attention_layer_base import AttentionLayerBase
-from vllm.model_executor.layers.fused_moe.routed_experts_capturer import (
-    RoutedExpertsCapturer,
-)
-from vllm.model_executor.layers.rotary_embedding import (
-    MRotaryEmbedding,
-    XDRotaryEmbedding,
-)
+from vllm.model_executor.layers.fused_moe.routed_experts_capturer import \
+    RoutedExpertsCapturer
+from vllm.model_executor.layers.rotary_embedding import (MRotaryEmbedding,
+                                                         XDRotaryEmbedding)
 from vllm.model_executor.model_loader import get_model_loader
 from vllm.model_executor.model_loader.reload import (
-    finalize_layerwise_reload,
-    initialize_layerwise_reload,
-)
-from vllm.model_executor.models.interfaces import (
-    MultiModalEmbeddings,
-    SupportsMRoPE,
-    SupportsMultiModal,
-    SupportsXDRoPE,
-    is_mixture_of_experts,
-    supports_eagle3,
-    supports_mrope,
-    supports_multimodal_pruning,
-    supports_realtime,
-    supports_transcription,
-    supports_xdrope,
-)
+    finalize_layerwise_reload, initialize_layerwise_reload)
+from vllm.model_executor.models.interfaces import (MultiModalEmbeddings,
+                                                   SupportsMRoPE,
+                                                   SupportsMultiModal,
+                                                   SupportsXDRoPE,
+                                                   is_mixture_of_experts,
+                                                   supports_eagle3,
+                                                   supports_mrope,
+                                                   supports_multimodal_pruning,
+                                                   supports_realtime,
+                                                   supports_transcription,
+                                                   supports_xdrope)
 from vllm.model_executor.models.interfaces_base import (
-    VllmModelForPooling,
-    is_pooling_model,
-    is_text_generation_model,
-)
-from vllm.model_executor.offloader import (
-    create_offloader,
-    get_offloader,
-    set_offloader,
-)
+    VllmModelForPooling, is_pooling_model, is_text_generation_model)
+from vllm.model_executor.offloader import (create_offloader, get_offloader,
+                                           set_offloader)
 from vllm.multimodal import MULTIMODAL_REGISTRY
 from vllm.multimodal.encoder_budget import MultiModalBudget
-from vllm.multimodal.inputs import (
-    BatchedTensorInputs,
-    MultiModalKwargsItem,
-    PlaceholderRange,
-)
+from vllm.multimodal.inputs import (BatchedTensorInputs, MultiModalKwargsItem,
+                                    PlaceholderRange)
 from vllm.multimodal.utils import group_and_batch_mm_kwargs
 from vllm.platforms import current_platform
 from vllm.pooling_params import PoolingParams
@@ -105,54 +77,34 @@ from vllm.utils import length_from_prompt_token_ids_or_embeds
 from vllm.utils.math_utils import cdiv, round_up
 from vllm.utils.mem_utils import DeviceMemoryProfiler, format_gib
 from vllm.utils.nvtx_pytorch_hooks import PytHooks
-from vllm.utils.platform_utils import is_pin_memory_available, num_compute_units
-from vllm.utils.torch_utils import (
-    get_dtype_size,
-    kv_cache_dtype_str_to_dtype,
-)
-from vllm.v1.attention.backend import (
-    AttentionBackend,
-    AttentionCGSupport,
-    AttentionMetadata,
-    AttentionMetadataBuilder,
-    AttentionType,
-    CommonAttentionMetadata,
-)
+from vllm.utils.platform_utils import (is_pin_memory_available,
+                                       num_compute_units)
+from vllm.utils.torch_utils import get_dtype_size, kv_cache_dtype_str_to_dtype
+from vllm.v1.attention.backend import (AttentionBackend, AttentionCGSupport,
+                                       AttentionMetadata,
+                                       AttentionMetadataBuilder, AttentionType,
+                                       CommonAttentionMetadata)
 from vllm.v1.attention.backends.gdn_attn import GDNAttentionMetadataBuilder
-from vllm.v1.attention.backends.mamba2_attn import Mamba2AttentionMetadataBuilder
+from vllm.v1.attention.backends.mamba2_attn import \
+    Mamba2AttentionMetadataBuilder
 from vllm.v1.attention.backends.utils import (
-    create_fast_prefill_custom_backend,
-    get_dcp_local_seq_lens,
-    reorder_batch_to_split_decodes_and_prefills,
-)
+    create_fast_prefill_custom_backend, get_dcp_local_seq_lens,
+    reorder_batch_to_split_decodes_and_prefills)
 from vllm.v1.core.sched.output import NewRequestData
 from vllm.v1.cudagraph_dispatcher import CudagraphDispatcher
-from vllm.v1.kv_cache_interface import (
-    AttentionSpec,
-    ChunkedLocalAttentionSpec,
-    CrossAttentionSpec,
-    EncoderOnlyAttentionSpec,
-    FullAttentionSpec,
-    KVCacheConfig,
-    KVCacheGroupSpec,
-    KVCacheSpec,
-    MambaSpec,
-    SlidingWindowSpec,
-    UniformTypeKVCacheSpecs,
-)
-from vllm.v1.outputs import (
-    EMPTY_MODEL_RUNNER_OUTPUT,
-    AsyncModelRunnerOutput,
-    DraftTokenIds,
-    ECConnectorOutput,
-    KVConnectorOutput,
-    LogprobsLists,
-    LogprobsTensors,
-    ModelRunnerOutput,
-    PoolerOutput,
-    SamplerOutput,
-    make_empty_encoder_model_runner_output,
-)
+from vllm.v1.kv_cache_interface import (AttentionSpec,
+                                        ChunkedLocalAttentionSpec,
+                                        CrossAttentionSpec,
+                                        EncoderOnlyAttentionSpec,
+                                        FullAttentionSpec, KVCacheConfig,
+                                        KVCacheGroupSpec, KVCacheSpec,
+                                        MambaSpec, SlidingWindowSpec,
+                                        UniformTypeKVCacheSpecs)
+from vllm.v1.outputs import (EMPTY_MODEL_RUNNER_OUTPUT, AsyncModelRunnerOutput,
+                             DraftTokenIds, ECConnectorOutput,
+                             KVConnectorOutput, LogprobsLists, LogprobsTensors,
+                             ModelRunnerOutput, PoolerOutput, SamplerOutput,
+                             make_empty_encoder_model_runner_output)
 from vllm.v1.pool.metadata import PoolingMetadata, PoolingStates
 from vllm.v1.sample.logits_processor import LogitsProcessors, build_logitsprocs
 from vllm.v1.sample.logits_processor.interface import LogitsProcessor
@@ -161,45 +113,36 @@ from vllm.v1.sample.rejection_sampler import RejectionSampler
 from vllm.v1.sample.sampler import Sampler
 from vllm.v1.spec_decode.draft_model import DraftModelProposer
 from vllm.v1.spec_decode.eagle import EagleProposer
-from vllm.v1.spec_decode.extract_hidden_states import ExtractHiddenStatesProposer
+from vllm.v1.spec_decode.extract_hidden_states import \
+    ExtractHiddenStatesProposer
 from vllm.v1.spec_decode.medusa import MedusaProposer
 from vllm.v1.spec_decode.metadata import SpecDecodeMetadata
 from vllm.v1.spec_decode.ngram_proposer_gpu import (
-    NgramProposerGPU,
-    copy_num_valid_draft_tokens,
-    update_ngram_gpu_tensors_incremental,
-    update_scheduler_for_invalid_drafts,
-)
+    NgramProposerGPU, copy_num_valid_draft_tokens,
+    update_ngram_gpu_tensors_incremental, update_scheduler_for_invalid_drafts)
 from vllm.v1.spec_decode.suffix_decoding import SuffixDecodingProposer
 from vllm.v1.structured_output.utils import apply_grammar_bitmask
 from vllm.v1.utils import CpuGpuBuffer, record_function_or_nullcontext
 from vllm.v1.worker import mamba_utils
-from vllm.v1.worker.cp_utils import (
-    check_attention_cp_compatibility,
-    get_total_cp_world_size,
-)
+from vllm.v1.worker.cp_utils import (check_attention_cp_compatibility,
+                                     get_total_cp_world_size)
 from vllm.v1.worker.dp_utils import coordinate_batch_across_dp
-from vllm.v1.worker.ec_connector_model_runner_mixin import ECConnectorModelRunnerMixin
+from vllm.v1.worker.ec_connector_model_runner_mixin import \
+    ECConnectorModelRunnerMixin
 from vllm.v1.worker.gpu_input_batch import CachedRequestState, InputBatch
 from vllm.v1.worker.gpu_ubatch_wrapper import UBatchWrapper
-from vllm.v1.worker.kv_connector_model_runner_mixin import KVConnectorModelRunnerMixin
+from vllm.v1.worker.kv_connector_model_runner_mixin import \
+    KVConnectorModelRunnerMixin
 from vllm.v1.worker.lora_model_runner_mixin import LoRAModelRunnerMixin
-from vllm.v1.worker.ubatch_utils import (
-    UBatchSlices,
-    check_ubatch_thresholds,
-    maybe_create_ubatch_slices,
-    split_attn_metadata,
-)
+from vllm.v1.worker.ubatch_utils import (UBatchSlices, check_ubatch_thresholds,
+                                         maybe_create_ubatch_slices,
+                                         split_attn_metadata)
 from vllm.v1.worker.utils import is_residual_scattered_for_sp
 from vllm.v1.worker.workspace import lock_workspace
 
-from .utils import (
-    AttentionGroup,
-    add_kv_sharing_layers_to_kv_cache_groups,
-    bind_kv_cache,
-    prepare_kernel_block_sizes,
-    sanity_check_mm_encoder_outputs,
-)
+from .utils import (AttentionGroup, add_kv_sharing_layers_to_kv_cache_groups,
+                    bind_kv_cache, prepare_kernel_block_sizes,
+                    sanity_check_mm_encoder_outputs)
 
 if TYPE_CHECKING:
     from vllm.v1.core.sched.output import GrammarOutput, SchedulerOutput
@@ -4009,18 +3952,52 @@ class GPUModelRunner(
                 else:
                     logger.error("RoutedExpertsCapturer not initialized.")
 
-            # Convert SMC log-weights tensor to dict indexed by req_id
-            smc_log_weights_dict: dict[str, float] | None = None
-            if (
-                sampler_output is not None
-                and sampler_output.smc_log_weights is not None
-            ):
-                w = sampler_output.smc_log_weights.tolist()
-                smc_log_weights_dict = {
-                    req_ids_output_copy[i]: w[i]
-                    for i in range(len(req_ids_output_copy))
-                }
-
+            # Convert SMC-related tensors to dicts indexed by req_id.
+            smc_log_weight_update: dict[str, float] | None = None
+            smc_sampled_logprob: dict[str, float] | None = None
+            smc_alpha_diff: dict[str, float] | None = None
+            if sampler_output is not None:
+                # Check that the updates are either all present or all None (otherwise 
+                # something is wrong with the logic).
+                _num_none = sum(
+                    1
+                    for x in [
+                        sampler_output.smc_log_weight_update,
+                        sampler_output.smc_sampled_logprob,
+                        sampler_output.smc_alpha_diff,
+                    ]
+                    if x is None
+                )
+                if _num_none not in (0, 3):
+                    raise ValueError(
+                        f"SMC outputs must be either all present or all None, but got "
+                        f"{sampler_output.smc_log_weight_update is None=}, "
+                        f"{sampler_output.smc_sampled_logprob is None=}, "
+                        f"{sampler_output.smc_alpha_diff is None=}"
+                    )
+                if _num_none == 0:
+                    smc_log_weight_update = {
+                        idx: x
+                        for idx, x in zip(
+                            req_ids_output_copy, 
+                            sampler_output.smc_log_weight_update.tolist(),
+                        )
+                    }
+                    smc_sampled_logprob = {
+                        idx: x
+                        for idx, x in zip(
+                            req_ids_output_copy, 
+                            sampler_output.smc_sampled_logprob.tolist(),
+                        )
+                    }
+                    smc_alpha_diff = {
+                        idx: x
+                        for idx, x in zip(
+                            req_ids_output_copy, 
+                            sampler_output.smc_alpha_diff.tolist(),
+                        )
+                    }
+                    
             output = ModelRunnerOutput(
                 req_ids=req_ids_output_copy,
                 req_id_to_index=req_id_to_index_output_copy,
@@ -4033,7 +4010,9 @@ class GPUModelRunner(
                 else None,
                 num_nans_in_logits=num_nans_in_logits,
                 cudagraph_stats=cudagraph_stats,
-                smc_log_weights=smc_log_weights_dict,
+                smc_log_weight_update=smc_log_weight_update,
+                smc_sampled_logprob=smc_sampled_logprob,
+                smc_alpha_diff=smc_alpha_diff,
             )
 
         if not self.use_async_scheduling:
@@ -5509,9 +5488,7 @@ class GPUModelRunner(
 
     def _init_minimal_kv_cache_for_profiling(self) -> None:
         from vllm.v1.core.kv_cache_utils import (
-            get_kv_cache_config_from_groups,
-            get_kv_cache_groups,
-        )
+            get_kv_cache_config_from_groups, get_kv_cache_groups)
 
         kv_cache_spec = self.get_kv_cache_spec()
         kv_cache_groups = get_kv_cache_groups(self.vllm_config, kv_cache_spec)
@@ -6504,9 +6481,8 @@ class GPUModelRunner(
 
     def _bind_routed_experts_capturer(self, capturer: RoutedExpertsCapturer) -> None:
         from vllm.model_executor.layers.fused_moe.layer import FusedMoE
-        from vllm.model_executor.layers.fused_moe.router.base_router import (
-            BaseRouter,
-        )
+        from vllm.model_executor.layers.fused_moe.router.base_router import \
+            BaseRouter
 
         for module in self.compilation_config.static_forward_context.values():
             if isinstance(module, FusedMoE) and isinstance(module.router, BaseRouter):
