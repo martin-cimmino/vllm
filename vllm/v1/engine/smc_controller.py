@@ -36,16 +36,14 @@ class ParticleGroup:
     parent_request_id: str
     child_request_ids: list[str]
     log_weights: list[float]
+    prefix_logprob: list[float]
     step_count: int = 0
     ess_threshold: float = 0.5
     alpha: float = 2.0
     alpha_ramp_tokens: int = 0
     original_max_tokens: int = 0  # user-specified max_tokens (for adjustments)
     original_prompt_len: int = 0  # length of original prompt tokens
-    # slot_index → cumulative log-weight frozen when that particle finished.
-    # Preserved across resampling events; zombie weights stay frozen for
-    # get_final_weights() voting.
-    frozen_weights: dict = field(default_factory=dict)
+    frozen_particles: set = field(default_factory=set)
 
 
 class SMCController:
@@ -90,16 +88,27 @@ class SMCController:
         """
         return self._id_to_original.get(request_id, request_id)
 
-    def accumulate(self, smc_log_weights: dict[str, float]) -> None:
-        """Add incremental log-weights from this step to each group."""
+    def accumulate(
+        self,
+        smc_log_weight_update: dict[str, float],
+        sampled_logprob: dict[str, float],
+        alpha_diff: dict[str, float],
+    ) -> None:
+        """Add incremental log-weights from this step to each group.
+        
+        The inputs are the values required to perform the log-weight update according to 
+        Algorithm 1 and sec 5.3. of the SMC paper:
+        - smc_log_weight_update: the incremental log-weight update for each particle 
+          (line 10 in Algorithm 1 of the paper)
+        - sampled_logprob: the log-probability of the newly sampled token for each 
+          particle (sec. 5.3 of the paper)
+        - alpha_diff: the difference in alpha values for this step vs. the previous step 
+          (sec. 5.3 of the paper)
+        """
         for pid, group in self._groups.items():
             for i, req_id in enumerate(group.child_request_ids):
-                # Only accumulate for active particles.
-                # Some frozen particles may still be active in the current step as
-                # active loser with frozen ancestor cannot be aborted so it is
-                # important to exclude frozen particles from accumulation to prevent
-                # their fixed weights from being incorrectly inflated by active incremental weights.
-                if req_id in smc_log_weight_update and i not in group.frozen_weights:
+                # only accumulate for active particles
+                if req_id in smc_log_weight_update and i not in group.frozen_particles:
                     # accumulate logprob of the prefix p(y_1:t | x) according to sec 5.3. of paper
                     group.prefix_logprob[i] += sampled_logprob[req_id]
                     # perform log-weight update according to line 10 in Algorithm 1 of paper
@@ -223,13 +232,11 @@ class SMCController:
 
             # 1. Detect newly finished particles; freeze their weight.
             for i, rid in enumerate(group.child_request_ids):
-                if rid not in requests and i not in group.frozen_weights:
-                    group.frozen_weights[i] = group.log_weights[i]
+                if rid not in requests and i not in group.frozen_particles:
+                    group.frozen_particles.add(i)
 
             # 2. Skip if all particles are finished.
-            has_active = any(
-                i not in group.frozen_weights for i in range(n)
-            )
+            has_active = any(i not in group.frozen_particles for i in range(n))
             if not has_active:
                 continue
 
@@ -241,7 +248,7 @@ class SMCController:
             logger.debug("Log weights before resampling: %s",
                          group.log_weights)
             logger.debug("Frozen weights before resampling: %s",
-                         group.frozen_weights)
+                         group.frozen_particles)
 
             # 4. Systematic resample over all N slots (frozen + active).
             ancestors = self.systematic_resample(group.log_weights)
@@ -251,7 +258,7 @@ class SMCController:
             ancestor_output_lens: dict[int, int] = {}
             ancestor_max_tokens: dict[int, int] = {}
             for slot in set(ancestors):
-                if slot in group.frozen_weights:
+                if slot in group.frozen_particles:
                     continue  # Frozen ancestor — no live KV state to clone.
                 rid = group.child_request_ids[slot]
                 req = requests.get(rid)
@@ -272,13 +279,13 @@ class SMCController:
             new_child_ids: list[str] = list(group.child_request_ids)
             frozen_weights_to_remove: list[int] = []
 
-            # Snapshot frozen_weights before the loop so that all slot
-            # decisions are based on pre-resample state.  Without this, a
-            # slot k that becomes frozen during iteration (because its own
+            # Snapshot which particles are frozen before the loop so that all
+            # slot decisions are based on pre-resample state.  Without this,
+            # a slot k that becomes frozen during iteration (because its own
             # ancestor is frozen) would cause later slots pointing to k to
             # incorrectly inherit its frozen weight instead of getting a new
             # particle from k.
-            frozen_before_resample = set(group.frozen_weights)
+            frozen_before_resample = group.frozen_particles.copy()
 
             for slot_idx in range(n):
                 anc_idx = ancestors[slot_idx]
@@ -293,16 +300,11 @@ class SMCController:
                 # frozen itself.  Active losers are NOT aborted (no
                 # replacement → scheduler halt).
                 if anc_idx in frozen_before_resample:
-                    group.frozen_weights[slot_idx] = (
-                        group.frozen_weights[anc_idx]
-                    )
-                    group.log_weights[slot_idx] = (
-                        group.frozen_weights[slot_idx]
-                    )
+                    group.frozen_particles.add(slot_idx)
                     logger.debug(
                         "Slot %d: frozen ancestor %d (w=%.4f), "
                         "freezing slot", slot_idx, anc_idx,
-                        group.frozen_weights[anc_idx])
+                        group.frozen_particles)
                     continue
 
                 # --- Active ancestor: check remaining token budget. ---
@@ -315,9 +317,7 @@ class SMCController:
                 if remaining <= 0:
                     # Ancestor exhausted — freeze slot, don't abort
                     # (same rationale as frozen-ancestor case).
-                    group.frozen_weights[slot_idx] = group.log_weights[
-                        slot_idx
-                    ]
+                    group.frozen_particles.add(slot_idx)
                     logger.debug(
                         "Slot %d: ancestor %d exhausted budget "
                         "(max=%d, output=%d), freezing slot",
@@ -359,7 +359,7 @@ class SMCController:
 
             # De-freeze slots revived by an active winner.
             for slot_idx in frozen_weights_to_remove:
-                del group.frozen_weights[slot_idx]
+                group.frozen_particles.remove(slot_idx)
 
             logger.debug("Loser request IDs: %s", loser_req_ids)
 
@@ -372,16 +372,12 @@ class SMCController:
 
             group.child_request_ids = new_child_ids
 
-            # 7. Reset non-frozen weights to 0 (uniform after resample).
-            # Frozen weights are preserved for get_final_weights() voting.
-            for i in range(n):
-                if i not in group.frozen_weights:
-                    group.log_weights[i] = 0.0
-
+            # 7. Reset all log-weights to 0.0 (uniform after resample).
+            group.log_weights = [0.0] * len(group.log_weights)
             logger.debug("Log weights after resampling: %s",
                          group.log_weights)
             logger.debug("Frozen weights after resampling: %s",
-                         group.frozen_weights)
+                         group.frozen_particles)
 
         return resample_actions
 
