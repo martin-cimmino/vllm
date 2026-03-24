@@ -3979,21 +3979,21 @@ class GPUModelRunner(
                     smc_log_weight_update = {
                         idx: x
                         for idx, x in zip(
-                            req_ids_output_copy, 
+                            req_ids_output_copy,
                             sampler_output.smc_log_weight_update.tolist(),
                         )
                     }
                     smc_sampled_logprob = {
                         idx: x
                         for idx, x in zip(
-                            req_ids_output_copy, 
+                            req_ids_output_copy,
                             sampler_output.smc_sampled_logprob.tolist(),
                         )
                     }
                     smc_alpha_diff = {
                         idx: x
                         for idx, x in zip(
-                            req_ids_output_copy, 
+                            req_ids_output_copy,
                             sampler_output.smc_alpha_diff.tolist(),
                         )
                     }
