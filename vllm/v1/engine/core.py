@@ -462,10 +462,10 @@ class EngineCore:
                     particle.token_ids, orig_prompt_len
                 )
 
-        # 2. Abort losers (frozen losers may have no live scheduler request
-        # — finish_requests safely skips unknown IDs).
-        if action.loser_request_ids:
-            self.abort_requests(action.loser_request_ids)
+            # 2. Abort losers (frozen losers may have no live scheduler request
+            # — finish_requests safely skips unknown IDs).
+            if action.loser_request_ids:
+                self.abort_requests(action.loser_request_ids)
 
     def _smc_remap_outputs(
         self,
