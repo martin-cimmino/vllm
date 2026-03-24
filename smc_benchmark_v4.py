@@ -492,6 +492,7 @@ def run_one(
         "unique_answers": unique_answers,
         "gen_time_seconds": gen_time,
         "n_steps": len(instr.steps),
+        "unique_completions": len({c.text for c in completions}),
         "completions": [c.text for c in completions],
     }
 
@@ -627,6 +628,7 @@ def main():
         gpu_memory_utilization=args.gpu_memory_utilization,
         max_model_len=8192,
         enable_prefix_caching=True,
+        async_scheduling=False,  # TODO: IMPORTANT: ENFORCE this somewhere in the code when SMC is active
     )
     tokenizer = llm.get_tokenizer()
 
@@ -653,16 +655,15 @@ def main():
 
         # ── Baseline run (no resampling) ──
         if args.compare_baseline:
-            baseline_threshold = 0.001  # effectively never fires
             baseline = run_one(
                 llm, prompt,
                 n_particles=args.n_particles,
-                alpha=args.alpha,
-                ess_threshold=baseline_threshold,
+                alpha=1.0000001,  # samping almost from base model, however alpha must be > 1.0. in the code
+                ess_threshold=0.00000000001,  # effectively never fires
                 max_tokens=args.max_new_tokens,
                 seed=args.seed,
                 label="baseline",
-                alpha_ramp_tokens=args.alpha_ramp_tokens,
+                alpha_ramp_tokens=0,  # no ramping for baseline
             )
             problem_results["runs"]["baseline"] = baseline
         else:
@@ -746,11 +747,6 @@ def main():
         ".json"
     )
     output_file = Path(args.output_dir) / out_name
-
-    def _serializable(obj):
-        if isinstance(obj, float) and (math.isnan(obj) or math.isinf(obj)):
-            return str(obj)
-        return obj
 
     def _clean(d):
         if isinstance(d, dict):
