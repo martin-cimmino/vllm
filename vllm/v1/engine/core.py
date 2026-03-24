@@ -497,6 +497,28 @@ class EngineCore:
                             output.smc_winner_token_ids = token_info[0]
                             output.smc_winner_prompt_len = token_info[1]
 
+    def _run_smc_hooks(self, model_output: ModelRunnerOutput | None) -> None:
+        """Apply per-step SMC accumulation and optional resampling."""
+        if model_output is None or not model_output.smc_log_weight_update:
+            return
+
+        # If smc_log_weight_update is present, the other SMC tensors are also
+        # expected to be present.
+        assert model_output.smc_sampled_logprob is not None
+        assert model_output.smc_alpha_diff is not None
+
+        self._smc_auto_register_from_weights(model_output.smc_log_weight_update)
+        self.smc_controller.accumulate(
+            model_output.smc_log_weight_update,
+            model_output.smc_sampled_logprob,
+            model_output.smc_alpha_diff,
+        )
+        resample_actions = self.smc_controller.maybe_resample(
+            self.scheduler.requests
+        )
+        if resample_actions:
+            self._apply_resample_actions(resample_actions)
+
     def abort_requests(self, request_ids: list[str]):
         """Abort requests from the scheduler."""
 
@@ -574,14 +596,7 @@ class EngineCore:
                 model_output = self.model_executor.sample_tokens(grammar_output)
 
         # SMC hook: accumulate weights and maybe resample
-        if model_output is not None and model_output.smc_log_weight_update:
-            self._smc_auto_register_from_weights(model_output.smc_log_weight_update)
-            self.smc_controller.accumulate(model_output.smc_log_weight_update)
-            resample_actions = self.smc_controller.maybe_resample(
-                self.scheduler.requests
-            )
-            if resample_actions:
-                self._apply_resample_actions(resample_actions)
+        self._run_smc_hooks(model_output)
 
         # Before processing the model output, process any aborts that happened
         # during the model execution.
@@ -699,23 +714,7 @@ class EngineCore:
                 raise RuntimeError("unexpected error")
 
         # SMC hook: accumulate weights and maybe resample
-        if model_output is not None and model_output.smc_log_weight_update:
-            # if model_output.smc_log_weight_update is not None we assume also the other
-            # SMC-related quantities are not None
-            assert model_output.smc_sampled_logprob is not None
-            assert model_output.smc_alpha_diff is not None
-
-            self._smc_auto_register_from_weights(model_output.smc_log_weight_update)
-            self.smc_controller.accumulate(
-                model_output.smc_log_weight_update,
-                model_output.smc_sampled_logprob,
-                model_output.smc_alpha_diff,
-            )
-            resample_actions = self.smc_controller.maybe_resample(
-                self.scheduler.requests
-            )
-            if resample_actions:
-                self._apply_resample_actions(resample_actions)
+        self._run_smc_hooks(model_output)
 
         # Before processing the model output, process any aborts that happened
         # during the model execution.
