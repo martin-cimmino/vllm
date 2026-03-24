@@ -258,7 +258,7 @@ class Sampler(nn.Module):
         alpha_t = smc_alphas.to(dtype=torch.float32)
         # Apply α ramp: alpha_eff = min(alpha, 1.0 + (alpha-1.0) * step/ramp_tokens)
         if (
-            sampling_metadata.smc_alpha_ramp_tokens is not None 
+            sampling_metadata.smc_alpha_ramp_tokens is not None
             and sampling_metadata.smc_step_counts is not None
         ):
             ramp = sampling_metadata.smc_alpha_ramp_tokens.to(dtype=torch.float32, device=device)
@@ -266,25 +266,12 @@ class Sampler(nn.Module):
             
             steps = sampling_metadata.smc_step_counts.to(dtype=torch.float32, device=device)
             if previous:
-                steps = steps - 1.0  # get the step count for the previous step
+                steps = torch.maximum(steps - 1.0, torch.zeros_like(steps))  # get the step count for the previous step
 
-            ramped = 1.0 + (alpha_t - 1.0) * (steps + 1.0) / ramp.clamp(min=1.0)  # TODO: why steps + 1? at step 0 it should be ramped=1, at step "ramp" is shuold be ramped=alpha
+            ramped = 1.0 + (alpha_t - 1.0) * steps / ramp.clamp(min=1.0)
             alpha_t = torch.where(apply_ramp_mask, torch.minimum(alpha_t, ramped), alpha_t)
         return alpha_t
 
-
-    # TODO: there are many different errors here:
-    # - the log_p is computed on the whole vocabulary, but the SMC weight should only be computed on the sampled token. Consequently, the formula in the docstring doesn't seem correct.
-    # - there is not correction of the weights during ramp up when alpha changes, See sec 5.3
-    # - the proposal distribution q is not considered in the formula or implementation, see line 10 in Algorithm 1 in the paper.
-    # 
-    # REMARK: notice that these are the UPDATES for the weights, not the weights themselves. 
-    # The accumulation is done at SMCController.accumulate, which simply does log_w += update 
-    # where the update is the output of _compute_smc_weights. This means that any correction during ramp up needs to
-    # be done here as well, which means there is another mistake:
-    # - there is no ramp up correction in the weights updates, see sec 5.3 in the paper. 
-    #   Notice that to fix this we need to keep in memory the ENTIRE log_p(y_1:t) of the 
-    #   prefix and update that. Is it done anywhere? And if so, is it updated during resampling?
     def _compute_smc_updates(
         self,
         logits: torch.Tensor,
