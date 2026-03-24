@@ -252,6 +252,7 @@ class SMCController:
 
             # 4. Systematic resample over all N slots (frozen + active).
             ancestors = self.systematic_resample(group.log_weights)
+            ancestors = _rearrange_ancestors(ancestors)
 
             # 5. Gather token sequences from active ancestors (for cloning).
             ancestor_token_seqs: dict[int, list[int]] = {}
@@ -397,3 +398,25 @@ class SMCController:
             else:
                 result[i] = group.log_weights[i]
         return result
+
+
+def _rearrange_ancestors(ancestors: list[int]) -> list[int]:
+    """Rearrange ancestors so that, if a particle is among the ancestors, it becomes 
+    its own ancestor (i.e. wins itself and keeps its slot).
+    
+    This makes resampling more efficient without compromising its correctness.
+
+    For example:
+        input ancestors = [2, 0, 2, 1]
+        output ancestors = [0, 1, 2, 2] (0, 1 and 2 become self ancestors)
+    """
+    unique_anc = set(ancestors)
+    ancestors = ancestors.copy()
+    for i in range(len(ancestors)):
+        if i in unique_anc:
+            # Find the next index of i in ancestors and swap it with the current
+            # index. This has quadratic complexity, but we don't expect to have a
+            # huge number of particles.
+            idx = ancestors.index(i)
+            ancestors[i], ancestors[idx] = ancestors[idx], ancestors[i]
+    return ancestors
