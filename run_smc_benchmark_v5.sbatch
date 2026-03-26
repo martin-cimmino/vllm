@@ -6,17 +6,18 @@
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
 #SBATCH --exclusive
-#SBATCH --time=24:00:00
+#SBATCH --time=00:30:00
 #SBATCH --gres=gpu:1
-#SBATCH --output=logs/smc_bench_v5_%j.out
-#SBATCH --error=logs/smc_bench_v5_%j.err
+#SBATCH --output=smc_results/logs/smc_bench_v5_%j.out
+#SBATCH --error=smc_results/logs/smc_bench_v5_%j.err
 
 # ── Environment ───────────────────────────────────────────────────────
-cd /leonardo_scratch/fast/AIFAC_L13_018/mcimmino/vllm
+cd /leonardo_scratch/fast/AIFAC_L13_018/nruggeri/vllm
 source .venv/bin/activate
 module load cuda/12.2
 
-export HF_DATASETS_CACHE="/leonardo_scratch/fast/AIFAC_L13_018/mcimmino/hf_cache"
+export HF_HOME="/leonardo_scratch/fast/AIFAC_L13_018/nruggeri/hf_cache"
+export HF_DATASETS_CACHE="/leonardo_scratch/fast/AIFAC_L13_018/nruggeri/hf_cache"
 export HF_DATASETS_OFFLINE=1
 export TOKENIZERS_PARALLELISM=false
 export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
@@ -52,7 +53,7 @@ while [[ $# -gt 0 ]]; do
     esac
 done
 
-mkdir -p logs smc_results
+mkdir -p logs smc_results smc_results/logs "$HF_HOME" "$HF_DATASETS_CACHE"
 
 echo "========================================================"
 echo "  SMC Benchmark v5 — AIME 2025 Multi-Problem"

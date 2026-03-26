@@ -12,7 +12,7 @@
 #SBATCH --error=logs/smc_bench_v4_%j.err
 
 # ── Environment ───────────────────────────────────────────────────────
-cd /leonardo_scratch/fast/AIFAC_L13_018/mcimmino/vllm
+# cd /leonardo_scratch/fast/AIFAC_L13_018/mcimmino/vllm
 source .venv/bin/activate
 module load cuda/12.2
 
@@ -23,13 +23,15 @@ export VLLM_ENABLE_V1_MULTIPROCESSING=0
 
 # ── Default parameters (override via --arg) ───────────────────────────
 MODEL=/leonardo_scratch/fast/AIFAC_L13_018/models/Domyn-Small-v0.2-bf16
-N_PARTICLES=8
-ALPHA=2.0
+N_PARTICLES=64
+ALPHA=4.0
 ESS_THRESHOLD=0.5
-MAX_NEW_TOKENS=2048
-SEED=42
-PROBLEM_IDX=2
+MAX_NEW_TOKENS=8192
+SEED=17
+PROBLEM_IDX=4
+PROBLEM_FLAG=""
 COMPARE=""
+ALPHA_RAMP_TOKENS=100
 
 # Parse optional overrides passed after '--'
 while [[ $# -gt 0 ]]; do
@@ -37,6 +39,7 @@ while [[ $# -gt 0 ]]; do
         --n_particles) N_PARTICLES=$2; shift 2;;
         --alpha) ALPHA=$2; shift 2;;
         --ess_threshold) ESS_THRESHOLD=$2; shift 2;;
+        --alpha_ramp_tokens) ALPHA_RAMP_TOKENS=$2; shift 2;;
         --max_new_tokens) MAX_NEW_TOKENS=$2; shift 2;;
         --seed) SEED=$2; shift 2;;
         --problem_idx) PROBLEM_IDX=$2; shift 2;;
@@ -62,8 +65,10 @@ python smc_benchmark_v4.py \
     --ess_threshold "$ESS_THRESHOLD" \
     --max_new_tokens "$MAX_NEW_TOKENS" \
     --seed "$SEED" \
-    ${PROBLEM_FLAG:-"--problem_idx $PROBLEM_IDX"} \
+    ${PROBLEM_FLAG:-${PROBLEM_IDX:+--problem_idx $PROBLEM_IDX}} \
     $COMPARE \
-    --output_dir smc_results
+    --output_dir smc_results \
+    --alpha_ramp_tokens "$ALPHA_RAMP_TOKENS" \
+    --thinking
 
 echo "Job finished at $(date)"
