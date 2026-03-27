@@ -29,7 +29,8 @@ from pathlib import Path
 from statistics import mean
 from typing import Any
 
-from smc_benchmark_v4 import (extract_aime_answer, format_prompt,
+from smc_benchmark_v4 import (_clean_dict_for_json_formatting,
+                              extract_aime_answer, format_prompt,
                               majority_vote, run_one)
 
 # Force single-process mode so SMCInstrumentation monkey-patches work in-process
@@ -443,17 +444,14 @@ def main():
     )
     output_file = Path(args.output_dir) / out_name
 
-    output = {"summary": summary, "details": _clean(all_results)}
+    output = {
+        "summary": summary, 
+        "details": _clean_dict_for_json_formatting(all_results),
+    }
     with open(output_file, "w") as f:
         json.dump(output, f, indent=2, default=str)
     print(f"\nResults saved to {output_file}")
 
 
 if __name__ == "__main__":
-    main()
-    main()
-    main()
-    main()
-    main()
-    main()
     main()

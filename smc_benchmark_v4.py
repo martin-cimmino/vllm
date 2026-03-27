@@ -641,14 +641,14 @@ def _short(req_id: str) -> str:
     return parts[0] if parts else req_id
 
 
-def _clean(d):
+def _clean_dict_for_json_formatting(d):
     """Recursively clean a result dict for JSON serialization."""
     if isinstance(d, dict):
         return {
-            k: _clean(v) for k, v in d.items() if k != "texts"
+            k: _clean_dict_for_json_formatting(v) for k, v in d.items() if k != "texts"
         }  # omit raw generation text
     if isinstance(d, list):
-        return [_clean(v) for v in d]
+        return [_clean_dict_for_json_formatting(v) for v in d]
     if isinstance(d, float) and (math.isnan(d) or math.isinf(d)):
         return str(d)
     return d
@@ -851,7 +851,7 @@ def main():
     output_file = Path(args.output_dir) / out_name
 
     with open(output_file, "w") as f:
-        json.dump(_clean(all_results), f, indent=2, default=str)
+        json.dump(_clean_dict_for_json_formatting(all_results), f, indent=2, default=str)
     print(f"\nResults saved to {output_file}")
 
 
