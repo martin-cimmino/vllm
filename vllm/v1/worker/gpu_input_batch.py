@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 # Datastructures defining a GPU input batch
 
+import re
 from dataclasses import dataclass
 from typing import cast
 
@@ -16,11 +17,9 @@ from vllm.utils import length_from_prompt_token_ids_or_embeds
 from vllm.utils.collection_utils import swap_dict_values
 from vllm.v1.outputs import LogprobsTensors
 from vllm.v1.pool.metadata import PoolingMetadata, PoolingStates
-from vllm.v1.sample.logits_processor import (
-    BatchUpdateBuilder,
-    LogitsProcessors,
-    MoveDirectionality,
-)
+from vllm.v1.sample.logits_processor import (BatchUpdateBuilder,
+                                             LogitsProcessors,
+                                             MoveDirectionality)
 from vllm.v1.sample.metadata import SamplingMetadata
 from vllm.v1.utils import copy_slice
 from vllm.v1.worker.block_table import MultiGroupBlockTable
@@ -79,6 +78,8 @@ class CachedRequestState:
 
 
 class InputBatch:
+    _SMC_RESAMPLED_REQ_RE = re.compile(r"^smc_.*_(\d+)_(\d+)$")
+
     def __init__(
         self,
         max_num_reqs: int,
@@ -220,6 +221,12 @@ class InputBatch:
         )
         self.smc_alpha_cpu = self.smc_alpha_cpu_tensor.numpy()
         self.smc_alpha_ramp_cpu: np.ndarray = np.zeros(max_num_reqs, dtype=np.int32)
+        # Per-request offset for SMC step counts. For resampled requests this
+        # is the step index encoded in request_id (smc_<pid>_<step>_<slot>). For
+        # regular requests this remains 0.
+        self.smc_step_offset_cpu: np.ndarray = np.zeros(
+            max_num_reqs, dtype=np.int32
+        )
         self.smc_reqs: set[str] = set()
 
         # Speculative decoding
@@ -396,6 +403,7 @@ class InputBatch:
                 if sampling_params.smc_alpha_ramp_tokens
                 else 0
             )
+            self.smc_step_offset_cpu[req_index] = self._get_smc_step_offset(req_id)
             if sampling_params.smc_alpha is not None:
                 self.smc_reqs.add(req_id)
 
@@ -512,6 +520,7 @@ class InputBatch:
         self._req_ids[req_index] = None
         self.req_output_token_ids[req_index] = None
         self.spec_token_ids[req_index].clear()
+        self.smc_step_offset_cpu[req_index] = 0
 
         # LoRA
         lora_id = self.request_lora_mapping[req_index]
@@ -635,6 +644,10 @@ class InputBatch:
             self.repetition_penalties_cpu[i2],
             self.repetition_penalties_cpu[i1],
         )
+        self.smc_step_offset_cpu[i1], self.smc_step_offset_cpu[i2] = (
+            self.smc_step_offset_cpu[i2],
+            self.smc_step_offset_cpu[i1],
+        )
         self.num_accepted_tokens_cpu[i1], self.num_accepted_tokens_cpu[i2] = (
             self.num_accepted_tokens_cpu[i2],
             self.num_accepted_tokens_cpu[i1],
@@ -757,6 +770,9 @@ class InputBatch:
             self.repetition_penalties_cpu[empty_index] = self.repetition_penalties_cpu[
                 last_req_index
             ]
+            self.smc_step_offset_cpu[empty_index] = self.smc_step_offset_cpu[
+                last_req_index
+            ]
             self.num_accepted_tokens_cpu[empty_index] = self.num_accepted_tokens_cpu[
                 last_req_index
             ]
@@ -799,6 +815,36 @@ class InputBatch:
             logit_proc.update_state(batch_update)
         if batch_update:
             self.sampling_metadata = self._make_sampling_metadata()
+        elif self.smc_reqs:
+            # SMC step counts change every decode step even when the batch
+            # composition is unchanged, so refresh this tensor explicitly.
+            self.sampling_metadata.smc_step_counts = self._make_smc_step_counts(
+                self.num_reqs
+            )
+
+    def _make_smc_step_counts(self, num_reqs: int) -> torch.Tensor:
+        """Build per-request SMC decode step counts.
+
+        Counts only realized generated tokens and excludes async/spec
+        placeholders encoded as -1. For resampled requests, adds the step
+        offset encoded in the replacement request ID.
+        """
+        output_steps = np.fromiter(
+            (
+                sum(
+                    token_id != -1
+                    for token_id in cast(list[int], self.req_output_token_ids[i])
+                )
+                if self.req_output_token_ids[i] is not None
+                else 0
+                for i in range(num_reqs)
+            ),
+            count=num_reqs,
+            dtype=np.int32,
+        )
+        return torch.from_numpy(
+            (self.smc_step_offset_cpu[:num_reqs] + output_steps).copy()
+        )
 
     def _make_sampling_metadata(self) -> SamplingMetadata:
         num_reqs = self.num_reqs
@@ -868,16 +914,7 @@ class InputBatch:
         if self.smc_reqs:
             copy_slice(self.smc_alpha_cpu_tensor, self.smc_alpha, num_reqs)
             smc_alphas = self.smc_alpha[:num_reqs]
-            # Build step count and ramp tensors for α ramp
-            smc_step_counts = torch.tensor(
-                [
-                    len(self.req_output_token_ids[i])
-                    if self.req_output_token_ids[i] is not None
-                    else 0
-                    for i in range(num_reqs)
-                ],
-                dtype=torch.int32,
-            )
+            smc_step_counts = self._make_smc_step_counts(num_reqs)
             smc_alpha_ramp_tokens = torch.from_numpy(
                 self.smc_alpha_ramp_cpu[:num_reqs].copy()
             )
@@ -908,6 +945,18 @@ class InputBatch:
             smc_alpha_ramp_tokens=smc_alpha_ramp_tokens,
             smc_step_counts=smc_step_counts,
         )
+
+    @classmethod
+    def _get_smc_step_offset(cls, req_id: str) -> int:
+        """Return the resample step encoded in SMC replacement IDs.
+
+        Replacement particle IDs use: smc_<parent_id>_<step>_<slot>.
+        For non-SMC or initial particle IDs, returns 0.
+        """
+        match = cls._SMC_RESAMPLED_REQ_RE.match(req_id)
+        if match is None:
+            return 0
+        return int(match.group(1))
 
     def get_pooling_params(self) -> list[PoolingParams]:
         assert len(self.req_ids) == len(self.pooling_params)

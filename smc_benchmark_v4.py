@@ -38,13 +38,12 @@ import argparse
 import json
 import math
 import os
+import random
 import re
 import time
 from collections import Counter
 from pathlib import Path
 from typing import Any
-
-import random
 
 import torch
 
@@ -53,6 +52,7 @@ os.environ.setdefault("VLLM_ENABLE_V1_MULTIPROCESSING", "0")
 
 
 # ── SMC Primitives ────────────────────────────────────────────────────
+
 
 def compute_ess(log_weights: list[float]) -> float:
     """Normalized ESS ∈ [0, 1] from a list of log-weights."""
@@ -65,6 +65,7 @@ def compute_ess(log_weights: list[float]) -> float:
 
 
 # ── Answer Extraction ─────────────────────────────────────────────────
+
 
 def strip_think_blocks(text: str) -> str:
     text = re.sub(r"<think>.*?</think>", "", text, flags=re.DOTALL)
@@ -80,13 +81,13 @@ def _extract_boxed_content(text: str) -> list[str]:
         depth = 1
         i = start
         while i < len(text) and depth > 0:
-            if text[i] == '{':
+            if text[i] == "{":
                 depth += 1
-            elif text[i] == '}':
+            elif text[i] == "}":
                 depth -= 1
             i += 1
         if depth == 0:
-            results.append(text[start:i-1])
+            results.append(text[start : i - 1])
     return results
 
 
@@ -149,13 +150,15 @@ def extract_aime_answer(text: str) -> int | None:
 
 # ── Voting ────────────────────────────────────────────────────────────
 
+
 def majority_vote(answers: list[int | None]) -> int | None:
     valid = [a for a in answers if a is not None]
     return Counter(valid).most_common(1)[0][0] if valid else None
 
 
-def weighted_majority_vote(answers: list[int | None],
-                           log_weights: list[float]) -> int | None:
+def weighted_majority_vote(
+    answers: list[int | None], log_weights: list[float]
+) -> int | None:
     t = torch.tensor(log_weights, dtype=torch.float32)
     weights = torch.softmax(t, dim=0).tolist()
     vote: dict[int, float] = {}
@@ -164,7 +167,12 @@ def weighted_majority_vote(answers: list[int | None],
             vote[ans] = vote.get(ans, 0.0) + w
     return max(vote, key=vote.__getitem__) if vote else None  # type: ignore[arg-type]
 
-def snis_draw(answers: list[int | None], log_weights: list[float], rng: torch.Generator | None = None) -> int | None:
+
+def snis_draw(
+    answers: list[int | None],
+    log_weights: list[float],
+    rng: torch.Generator | None = None,
+) -> int | None:
     t = torch.tensor(log_weights, dtype=torch.float32)
     probs = torch.softmax(t, dim=0)
     idx = torch.multinomial(probs, num_samples=1, generator=rng).item()
@@ -172,6 +180,7 @@ def snis_draw(answers: list[int | None], log_weights: list[float], rng: torch.Ge
 
 
 # ── Instrumentation ───────────────────────────────────────────────────
+
 
 class SMCInstrumentation:
     """Context manager that instruments SMCController for observation.
@@ -198,31 +207,40 @@ class SMCInstrumentation:
 
     def __enter__(self):
         from vllm.v1.engine.smc_controller import SMCController
+
         self._orig_accumulate = SMCController.accumulate
         self._orig_maybe_resample = SMCController.maybe_resample
         instr = self
 
-        def patched_accumulate(ctrl_self, smc_log_weights: dict[str, float]) -> None:
+        def patched_accumulate(
+            ctrl_self,
+            smc_log_weight_update: dict[str, float],
+            smc_sampled_logprob: dict[str, float],
+            smc_alpha_diff: dict[str, float],
+        ) -> None:
             step_idx = len(instr.steps)
             instr._controller = ctrl_self  # capture on first call
-            for req_id, w in smc_log_weights.items():
+            for req_id, w in smc_log_weight_update.items():
                 instr._cum_weights[req_id] = instr._cum_weights.get(req_id, 0.0) + w
             # Call the original first so group.log_weights are already updated,
             # then compute ESS from the post-update weights.
-            result = instr._orig_accumulate(ctrl_self, smc_log_weights)
+            result = instr._orig_accumulate(
+                ctrl_self,
+                smc_log_weight_update,
+                smc_sampled_logprob,
+                smc_alpha_diff,
+            )
             group_ess: dict[str, float] = {}
             for pid, group in ctrl_self._groups.items():
-                active_weights = [
-                    lw for i, lw in enumerate(group.log_weights) if i not in group.frozen_weights
-                ]
-                #ess = ctrl_self.compute_ess(active_weights)
                 ess = ctrl_self.compute_ess(group.log_weights)
                 group_ess[pid] = ess
-            instr.steps.append({
-                "step": step_idx,
-                "req_weights": dict(smc_log_weights),
-                "group_ess": group_ess,
-            })
+            instr.steps.append(
+                {
+                    "step": step_idx,
+                    "req_weights": dict(smc_log_weight_update),
+                    "group_ess": group_ess,
+                }
+            )
             return result
 
         def patched_maybe_resample(ctrl_self, requests) -> dict:
@@ -239,7 +257,8 @@ class SMCInstrumentation:
                             "ancestor_id": p.ancestor_request_id,
                             "slot": p.slot_index,
                             "num_output_tokens": p.num_output_tokens,
-                            "remaining_tokens": p.original_max_tokens - p.num_output_tokens,
+                            "remaining_tokens": p.original_max_tokens
+                            - p.num_output_tokens,
                         }
                         for p in action.new_particles
                     ],
@@ -255,6 +274,7 @@ class SMCInstrumentation:
 
     def __exit__(self, *exc):
         from vllm.v1.engine.smc_controller import SMCController
+
         SMCController.accumulate = self._orig_accumulate
         SMCController.maybe_resample = self._orig_maybe_resample
 
@@ -291,6 +311,7 @@ class SMCInstrumentation:
 
 
 # ── Request ID → particle index mapping ──────────────────────────────
+
 
 def parse_particle_index(req_id: str) -> int | None:
     """Extract particle index from '<idx>_<parent_id>' naming convention."""
@@ -355,10 +376,10 @@ TEST_PROBLEMS = [
         "answer": 588,
     },
     {
-        "name":"Algebra — integer solutions to quadratic form",
-        "problem":"Find the number of ordered pairs $(x,y)$, where both $x$ and $y$ are integers between $-100$ and $100$, inclusive, such that $12x^{2}-xy-6y^{2}=0$.",
+        "name": "Algebra — integer solutions to quadratic form",
+        "problem": "Find the number of ordered pairs $(x,y)$, where both $x$ and $y$ are integers between $-100$ and $100$, inclusive, such that $12x^{2}-xy-6y^{2}=0$.",
         "answer": 117,
-    }
+    },
     # add problem 4 AIME
 ]
 
@@ -371,7 +392,9 @@ def format_prompt(problem: str, tokenizer, thinking: bool = False) -> str:
             if thinking:
                 messages.append({"role": "system", "content": "\nthinking on\n"})
             messages.append({"role": "user", "content": query})
-            print(f"Input prompt with chat template applied: {tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)}")
+            print(
+                f"Input prompt with chat template applied: {tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)}"
+            )
             return tokenizer.apply_chat_template(
                 messages, tokenize=False, add_generation_prompt=True
             )
@@ -381,6 +404,7 @@ def format_prompt(problem: str, tokenizer, thinking: bool = False) -> str:
 
 
 # ── One run ───────────────────────────────────────────────────────────
+
 
 def run_one(
     llm,
@@ -402,7 +426,8 @@ def run_one(
 
     sp = SamplingParams(
         n=n_particles,
-        temperature=1.0 / alpha, # proposal temperature (not the same as SMC alpha) optimal proposal: q*(v) ∝ p(v)^α
+        temperature=1.0
+        / alpha,  # proposal temperature (not the same as SMC alpha) optimal proposal: q*(v) ∝ p(v)^α
         smc_alpha=alpha,
         smc_ess_threshold=ess_threshold,
         smc_alpha_ramp_tokens=alpha_ramp_tokens if alpha_ramp_tokens > 0 else None,
@@ -412,8 +437,9 @@ def run_one(
         seed=seed,
     )
 
-    print(f"\n  [{label}] n={n_particles}, α={alpha}, τ={ess_threshold}, "
-          f"seed={seed}")
+    print(
+        f"\n  [{label}] n={n_particles}, α={alpha}, τ={ess_threshold}, " f"seed={seed}"
+    )
 
     instr = SMCInstrumentation()
     t_start = time.time()
@@ -421,9 +447,11 @@ def run_one(
         outputs = llm.generate([prompt], sp, use_tqdm=True)
     gen_time = time.time() - t_start
 
-    print(f"  [{label}] Done in {gen_time:.1f}s | "
-          f"{len(instr.steps)} steps | "
-          f"{len(instr.resample_events)} resampling event(s)")
+    print(
+        f"  [{label}] Done in {gen_time:.1f}s | "
+        f"{len(instr.steps)} steps | "
+        f"{len(instr.resample_events)} resampling event(s)"
+    )
 
     request_output = outputs[0]
     completions = request_output.outputs
@@ -458,7 +486,11 @@ def run_one(
     # Voting
     mv = majority_vote(answers)
     wv = weighted_majority_vote(answers, weight_vec)
-    snis = snis_draw(answers, weight_vec, rng=torch.Generator().manual_seed(seed) if seed is not None else None)
+    snis = snis_draw(
+        answers,
+        weight_vec,
+        rng=torch.Generator().manual_seed(seed) if seed is not None else None,
+    )
 
     unique_answers = len({a for a in answers if a is not None})
 
@@ -476,9 +508,9 @@ def run_one(
         "token_counts": token_counts,
         "weight_vec": weight_vec,
         "ess_trajectory": ess_traj,
-        "min_ess": min_ess,
-        "mean_ess": mean_ess,
-        "final_ess": final_ess,
+        "min_ess": min_ess if not math.isnan(min_ess) else None,
+        "mean_ess": mean_ess if not math.isnan(mean_ess) else None,
+        "final_ess": final_ess if not math.isnan(final_ess) else None,
         "n_resampling_events": len(instr.resample_events),
         "resampling_events": instr.resample_events,
         "majority_vote": mv,
@@ -487,11 +519,13 @@ def run_one(
         "unique_answers": unique_answers,
         "gen_time_seconds": gen_time,
         "n_steps": len(instr.steps),
+        "unique_completions": len({c.text for c in completions}),
         "completions": [c.text for c in completions],
     }
 
 
 # ── Comparison print ──────────────────────────────────────────────────
+
 
 def print_comparison(
     gt: int,
@@ -505,36 +539,63 @@ def print_comparison(
 
     def row(label, base_val, resamp_val, fmt=".4f"):
         b = format(base_val, fmt) if isinstance(base_val, float) else str(base_val)
-        r = format(resamp_val, fmt) if isinstance(resamp_val, float) else str(resamp_val)
+        r = (
+            format(resamp_val, fmt)
+            if isinstance(resamp_val, float)
+            else str(resamp_val)
+        )
         print(f"  {label:<35} {b:>12} {r:>12}")
 
-    row("ESS threshold (τ)",
+    row(
+        "ESS threshold (τ)",
         baseline["config"]["ess_threshold"],
-        resampled["config"]["ess_threshold"])
+        resampled["config"]["ess_threshold"],
+    )
     row("Steps (tokens generated / N)", baseline["n_steps"], resampled["n_steps"], "d")
-    row("Resampling events", baseline["n_resampling_events"],
-        resampled["n_resampling_events"], "d")
-    row("Min ESS (× N particles)",
-        baseline["min_ess"] * n, resampled["min_ess"] * n)
-    row("Mean ESS (× N particles)",
-        baseline["mean_ess"] * n, resampled["mean_ess"] * n)
-    row("Final ESS (× N particles)",
-        baseline["final_ess"] * n, resampled["final_ess"] * n)
-    row("Unique final answers",
-        baseline["unique_answers"], resampled["unique_answers"], "d")
+    row(
+        "Resampling events",
+        baseline["n_resampling_events"],
+        resampled["n_resampling_events"],
+        "d",
+    )
+    row("Min ESS (× N particles)", baseline["min_ess"] * n, resampled["min_ess"] * n)
+    row("Mean ESS (× N particles)", baseline["mean_ess"] * n, resampled["mean_ess"] * n)
+    row(
+        "Final ESS (× N particles)",
+        baseline["final_ess"] * n,
+        resampled["final_ess"] * n,
+    )
+    row(
+        "Unique final answers",
+        baseline["unique_answers"],
+        resampled["unique_answers"],
+        "d",
+    )
 
-    def vote_str(v): return f"{v} {'✓' if v == gt else '✗'}" if v is not None else "None"
-    row("Majority vote",
+    def vote_str(v):
+        return f"{v} {'✓' if v == gt else '✗'}" if v is not None else "None"
+
+    row(
+        "Majority vote",
         vote_str(baseline["majority_vote"]),
-        vote_str(resampled["majority_vote"]))
-    row("Weighted vote (cum. weights)",
+        vote_str(resampled["majority_vote"]),
+    )
+    row(
+        "Weighted vote (cum. weights)",
         vote_str(baseline["weighted_vote"]),
-        vote_str(resampled["weighted_vote"]))
-    row("SNIS draw (cum. weights)",
+        vote_str(resampled["weighted_vote"]),
+    )
+    row(
+        "SNIS draw (cum. weights)",
         vote_str(baseline["snis_draw"]),
-        vote_str(resampled["snis_draw"]))
-    row("Gen time (s)",
-        baseline["gen_time_seconds"], resampled["gen_time_seconds"], ".1f")
+        vote_str(resampled["snis_draw"]),
+    )
+    row(
+        "Gen time (s)",
+        baseline["gen_time_seconds"],
+        resampled["gen_time_seconds"],
+        ".1f",
+    )
     print(f"  {'─' * 62}")
 
     # Per-particle detail for resampling run
@@ -553,9 +614,11 @@ def print_comparison(
     if events:
         print(f"\n  Resampling events ({len(events)}):")
         for ev in events:
-            print(f"    step {ev['step']:>5}: parent={ev['parent_id']} | "
-                  f"losers={[_short(x) for x in ev['loser_ids']]} | "
-                  f"new slots={[p['slot'] for p in ev['new_particles']]}")
+            print(
+                f"    step {ev['step']:>5}: parent={ev['parent_id']} | "
+                f"losers={[_short(x) for x in ev['loser_ids']]} | "
+                f"new slots={[p['slot'] for p in ev['new_particles']]}"
+            )
     else:
         print(f"\n  No resampling events fired.")
 
@@ -565,8 +628,10 @@ def print_comparison(
         step_size = max(1, len(traj) // 10)
         checkpoints = list(range(0, len(traj), step_size)) + [len(traj) - 1]
         checkpoints = sorted(set(checkpoints))
-        print(f"\n  ESS trajectory [{resampled['label']}] "
-              f"(N={n}, every ~{step_size} steps):")
+        print(
+            f"\n  ESS trajectory [{resampled['label']}] "
+            f"(N={n}, every ~{step_size} steps):"
+        )
         print("  " + "  ".join(f"s{traj[c]*n:.1f}" for c in checkpoints))
 
 
@@ -576,30 +641,60 @@ def _short(req_id: str) -> str:
     return parts[0] if parts else req_id
 
 
+def _clean_dict_for_json_formatting(d):
+    """Recursively clean a result dict for JSON serialization."""
+    if isinstance(d, dict):
+        return {
+            k: _clean_dict_for_json_formatting(v) for k, v in d.items() if k != "texts"
+        }  # omit raw generation text
+    if isinstance(d, list):
+        return [_clean_dict_for_json_formatting(v) for v in d]
+    if isinstance(d, float) and (math.isnan(d) or math.isinf(d)):
+        return str(d)
+    return d
+
+
 # ── Main ──────────────────────────────────────────────────────────────
+
 
 def main():
     parser = argparse.ArgumentParser(
         description="Phase 2 Resampling Benchmark: live SMC resampling vs baseline"
     )
     parser.add_argument(
-        "--model", type=str,
+        "--model",
+        type=str,
         default="/leonardo_scratch/fast/AIFAC_L13_018/models/Domyn-Small-v0.2-bf16",
     )
     parser.add_argument("--n_particles", type=int, default=8)
     parser.add_argument("--alpha", type=float, default=2.0)
-    parser.add_argument("--alpha_ramp_tokens", type=int, default=0,
-                        help="Ramp α from 1.0 to alpha over this many tokens (0=disabled)")
-    parser.add_argument("--ess_threshold", type=float, default=0.5,
-                        help="ESS threshold for live resampling (must be in (0,1))")
+    parser.add_argument(
+        "--alpha_ramp_tokens",
+        type=int,
+        default=0,
+        help="Ramp α from 1.0 to alpha over this many tokens (0=disabled)",
+    )
+    parser.add_argument(
+        "--ess_threshold",
+        type=float,
+        default=0.5,
+        help="ESS threshold for live resampling (must be in (0,1))",
+    )
     parser.add_argument("--max_new_tokens", type=int, default=2048)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--thinking", action="store_true")
-    parser.add_argument("--problem_idx", type=int, default=2,
-                        help="0=combinatorics, 1=number theory, 2=algebra (default)")
+    parser.add_argument(
+        "--problem_idx",
+        type=int,
+        default=2,
+        help="0=combinatorics, 1=number theory, 2=algebra (default)",
+    )
     parser.add_argument("--all_problems", action="store_true")
-    parser.add_argument("--compare_baseline", action="store_true",
-                        help="Also run a no-resampling baseline for comparison")
+    parser.add_argument(
+        "--compare_baseline",
+        action="store_true",
+        help="Also run a no-resampling baseline for comparison",
+    )
     parser.add_argument("--tensor_parallel", type=int, default=1)
     parser.add_argument("--gpu_memory_utilization", type=float, default=0.9)
     parser.add_argument("--output_dir", type=str, default="./smc_results")
@@ -616,12 +711,14 @@ def main():
 
     print(f"\nLoading model: {args.model}")
     from vllm import LLM
+
     llm = LLM(
         model=args.model,
         tensor_parallel_size=args.tensor_parallel,
         gpu_memory_utilization=args.gpu_memory_utilization,
         max_model_len=8192,
         enable_prefix_caching=True,
+        async_scheduling=False,  # TODO: IMPORTANT: ENFORCE this somewhere in the code when SMC is active
     )
     tokenizer = llm.get_tokenizer()
 
@@ -638,8 +735,10 @@ def main():
 
         prompt = format_prompt(problem["problem"], tokenizer, thinking=args.thinking)
         prompt_len = len(tokenizer.encode(prompt))
-        print(f"Prompt: {prompt_len} tokens | "
-              f"n={args.n_particles}, α={args.alpha}, τ={args.ess_threshold}")
+        print(
+            f"Prompt: {prompt_len} tokens | "
+            f"n={args.n_particles}, α={args.alpha}, τ={args.ess_threshold}"
+        )
 
         problem_results: dict[str, Any] = {
             "problem": problem,
@@ -648,16 +747,16 @@ def main():
 
         # ── Baseline run (no resampling) ──
         if args.compare_baseline:
-            baseline_threshold = 0.001  # effectively never fires
             baseline = run_one(
-                llm, prompt,
+                llm,
+                prompt,
                 n_particles=args.n_particles,
-                alpha=args.alpha,
-                ess_threshold=baseline_threshold,
+                alpha=1.0000001,  # samping almost from base model, however alpha must be > 1.0. in the code
+                ess_threshold=0.00000000001,  # effectively never fires
                 max_tokens=args.max_new_tokens,
                 seed=args.seed,
                 label="baseline",
-                alpha_ramp_tokens=args.alpha_ramp_tokens,
+                alpha_ramp_tokens=0,  # no ramping for baseline
             )
             problem_results["runs"]["baseline"] = baseline
         else:
@@ -665,7 +764,8 @@ def main():
 
         # ── Resampling run ──
         resampled = run_one(
-            llm, prompt,
+            llm,
+            prompt,
             n_particles=args.n_particles,
             alpha=args.alpha,
             ess_threshold=args.ess_threshold,
@@ -683,10 +783,12 @@ def main():
         else:
             # Print just the resampling run
             n = args.n_particles
-            print(f"\n  ESS:  min={resampled['min_ess']*n:.2f}  "
-                  f"mean={resampled['mean_ess']*n:.2f}  "
-                  f"final={resampled['final_ess']*n:.2f}  "
-                  f"(×{n} particles)")
+            print(
+                f"\n  ESS:  min={resampled['min_ess']*n:.2f}  "
+                f"mean={resampled['mean_ess']*n:.2f}  "
+                f"final={resampled['final_ess']*n:.2f}  "
+                f"(×{n} particles)"
+            )
             print(f"  Resampling events: {resampled['n_resampling_events']}")
             mv = resampled["majority_vote"]
             wv = resampled["weighted_vote"]
@@ -701,27 +803,33 @@ def main():
             for i in range(n):
                 ans = resampled["answers"][i]
                 mark = "✓" if ans == gt else ("✗" if ans is not None else "")
-                print(f"  {i:>3}  {str(ans) if ans is not None else 'None':>8}  "
-                      f"{resampled['token_counts'][i]:>6}  "
-                      f"{resampled['weight_vec'][i]:>12.4f}  {mark}")
+                print(
+                    f"  {i:>3}  {str(ans) if ans is not None else 'None':>8}  "
+                    f"{resampled['token_counts'][i]:>6}  "
+                    f"{resampled['weight_vec'][i]:>12.4f}  {mark}"
+                )
 
             events = resampled["resampling_events"]
             if events:
                 print(f"\n  Resampling events:")
                 for ev in events:
-                    print(f"    step {ev['step']:>5}: "
-                          f"{len(ev['loser_ids'])} losers → "
-                          f"{len(ev['new_particles'])} new particles | "
-                          f"slots {[p['slot'] for p in ev['new_particles']]}")
+                    print(
+                        f"    step {ev['step']:>5}: "
+                        f"{len(ev['loser_ids'])} losers → "
+                        f"{len(ev['new_particles'])} new particles | "
+                        f"slots {[p['slot'] for p in ev['new_particles']]}"
+                    )
             else:
-                print(f"\n  No resampling events fired (ESS stayed above τ={args.ess_threshold}).")
+                print(
+                    f"\n  No resampling events fired (ESS stayed above τ={args.ess_threshold})."
+                )
 
             traj = resampled["ess_trajectory"]
             if traj:
                 step_size = max(1, len(traj) // 10)
-                checkpoints = sorted(set(
-                    list(range(0, len(traj), step_size)) + [len(traj) - 1]
-                ))
+                checkpoints = sorted(
+                    set(list(range(0, len(traj), step_size)) + [len(traj) - 1])
+                )
                 print(f"\n  ESS×N trajectory (every ~{step_size} steps):")
                 print("  " + "  ".join(f"s{traj[c]*n:.1f}" for c in checkpoints))
 
@@ -742,23 +850,8 @@ def main():
     )
     output_file = Path(args.output_dir) / out_name
 
-    def _serializable(obj):
-        if isinstance(obj, float) and (math.isnan(obj) or math.isinf(obj)):
-            return str(obj)
-        return obj
-
-    def _clean(d):
-        if isinstance(d, dict):
-            return {k: _clean(v) for k, v in d.items()
-                    if k != "texts"}  # omit full generation text from JSON
-        if isinstance(d, list):
-            return [_clean(v) for v in d]
-        if isinstance(d, float) and (math.isnan(d) or math.isinf(d)):
-            return str(d)
-        return d
-
     with open(output_file, "w") as f:
-        json.dump(_clean(all_results), f, indent=2, default=str)
+        json.dump(_clean_dict_for_json_formatting(all_results), f, indent=2, default=str)
     print(f"\nResults saved to {output_file}")
 
 

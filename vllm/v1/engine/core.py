@@ -28,47 +28,31 @@ from vllm.lora.request import LoRARequest
 from vllm.multimodal import MULTIMODAL_REGISTRY
 from vllm.tasks import POOLING_TASKS, SupportedTask
 from vllm.tracing import instrument, maybe_init_worker_tracer
-from vllm.transformers_utils.config import maybe_register_config_serialize_by_value
-from vllm.utils.gc_utils import (
-    freeze_gc_heap,
-    maybe_attach_gc_debug_callback,
-)
+from vllm.transformers_utils.config import \
+    maybe_register_config_serialize_by_value
+from vllm.utils.gc_utils import freeze_gc_heap, maybe_attach_gc_debug_callback
 from vllm.utils.hashing import get_hash_fn_by_name
 from vllm.utils.network_utils import make_zmq_socket
 from vllm.utils.system_utils import decorate_logs, set_process_title
-from vllm.v1.core.kv_cache_utils import (
-    BlockHash,
-    generate_scheduler_kv_cache_config,
-    get_kv_cache_configs,
-    get_request_block_hasher,
-    init_none_hash,
-)
+from vllm.v1.core.kv_cache_utils import (BlockHash,
+                                         generate_scheduler_kv_cache_config,
+                                         get_kv_cache_configs,
+                                         get_request_block_hasher,
+                                         init_none_hash)
 from vllm.v1.core.sched.interface import PauseState, SchedulerInterface
 from vllm.v1.core.sched.output import SchedulerOutput
-from vllm.v1.engine import (
-    EEP_NOTIFICATION_CALL_ID,
-    EEPNotificationType,
-    EngineCoreOutput,
-    EngineCoreOutputs,
-    EngineCoreRequest,
-    EngineCoreRequestType,
-    FinishReason,
-    PauseMode,
-    ReconfigureDistributedRequest,
-    ReconfigureRankType,
-    UtilityOutput,
-    UtilityResult,
-)
-from vllm.v1.engine.utils import (
-    EngineHandshakeMetadata,
-    EngineZmqAddresses,
-    SignalCallback,
-    get_device_indices,
-)
+from vllm.v1.engine import (EEP_NOTIFICATION_CALL_ID, EEPNotificationType,
+                            EngineCoreOutput, EngineCoreOutputs,
+                            EngineCoreRequest, EngineCoreRequestType,
+                            FinishReason, PauseMode,
+                            ReconfigureDistributedRequest, ReconfigureRankType,
+                            UtilityOutput, UtilityResult)
+from vllm.v1.engine.smc_controller import ResampleAction, SMCController
+from vllm.v1.engine.utils import (EngineHandshakeMetadata, EngineZmqAddresses,
+                                  SignalCallback, get_device_indices)
 from vllm.v1.executor import Executor
 from vllm.v1.kv_cache_interface import KVCacheConfig
 from vllm.v1.metrics.stats import SchedulerStats
-from vllm.v1.engine.smc_controller import SMCController, ResampleAction
 from vllm.v1.outputs import ModelRunnerOutput
 from vllm.v1.request import Request, RequestStatus
 from vllm.v1.serial_utils import MsgpackDecoder, MsgpackEncoder
@@ -463,8 +447,8 @@ class EngineCore:
                     arrival_time=time.time(),
                     block_hasher=self.request_block_hasher,
                 )
-                # Add directly to scheduler (skip _smc_maybe_register
-                # since the controller already updated child_request_ids).
+                # Add directly to scheduler since the controller 
+                # already updated child_request_ids.
                 self.scheduler.add_request(new_request)
                 # Mark this ID as needing a detokenizer reset on its first output.
                 self._smc_new_particle_ids.add(particle.new_request_id)
@@ -478,10 +462,10 @@ class EngineCore:
                     particle.token_ids, orig_prompt_len
                 )
 
-        # 2. Abort losers (frozen losers may have no live scheduler request
-        # — finish_requests safely skips unknown IDs).
-        if action.loser_request_ids:
-            self.abort_requests(action.loser_request_ids)
+            # 2. Abort losers (frozen losers may have no live scheduler request
+            # — finish_requests safely skips unknown IDs).
+            if action.loser_request_ids:
+                self.abort_requests(action.loser_request_ids)
 
     def _smc_remap_outputs(
         self,
@@ -512,6 +496,28 @@ class EngineCore:
                         if token_info is not None:
                             output.smc_winner_token_ids = token_info[0]
                             output.smc_winner_prompt_len = token_info[1]
+
+    def _run_smc_hooks(self, model_output: ModelRunnerOutput | None) -> None:
+        """Apply per-step SMC accumulation and optional resampling."""
+        if model_output is None or not model_output.smc_log_weight_update:
+            return
+
+        # If smc_log_weight_update is present, the other SMC tensors are also
+        # expected to be present.
+        assert model_output.smc_sampled_logprob is not None
+        assert model_output.smc_alpha_diff is not None
+
+        self._smc_auto_register_from_weights(model_output.smc_log_weight_update)
+        self.smc_controller.accumulate(
+            model_output.smc_log_weight_update,
+            model_output.smc_sampled_logprob,
+            model_output.smc_alpha_diff,
+        )
+        resample_actions = self.smc_controller.maybe_resample(
+            self.scheduler.requests
+        )
+        if resample_actions:
+            self._apply_resample_actions(resample_actions)
 
     def abort_requests(self, request_ids: list[str]):
         """Abort requests from the scheduler."""
@@ -590,14 +596,7 @@ class EngineCore:
                 model_output = self.model_executor.sample_tokens(grammar_output)
 
         # SMC hook: accumulate weights and maybe resample
-        if model_output is not None and model_output.smc_log_weights:
-            self._smc_auto_register_from_weights(model_output.smc_log_weights)
-            self.smc_controller.accumulate(model_output.smc_log_weights)
-            resample_actions = self.smc_controller.maybe_resample(
-                self.scheduler.requests
-            )
-            if resample_actions:
-                self._apply_resample_actions(resample_actions)
+        self._run_smc_hooks(model_output)
 
         # Before processing the model output, process any aborts that happened
         # during the model execution.
@@ -715,14 +714,7 @@ class EngineCore:
                 raise RuntimeError("unexpected error")
 
         # SMC hook: accumulate weights and maybe resample
-        if model_output is not None and model_output.smc_log_weights:
-            self._smc_auto_register_from_weights(model_output.smc_log_weights)
-            self.smc_controller.accumulate(model_output.smc_log_weights)
-            resample_actions = self.smc_controller.maybe_resample(
-                self.scheduler.requests
-            )
-            if resample_actions:
-                self._apply_resample_actions(resample_actions)
+        self._run_smc_hooks(model_output)
 
         # Before processing the model output, process any aborts that happened
         # during the model execution.
@@ -1835,7 +1827,8 @@ class DPEngineCoreProc(EngineCoreProc):
         self.current_wave = 0
         self.last_counts = (0, 0)
 
-        from vllm.distributed.elastic_ep.elastic_state import ElasticEPScalingState
+        from vllm.distributed.elastic_ep.elastic_state import \
+            ElasticEPScalingState
 
         self.eep_scaling_state: ElasticEPScalingState | None = None
 
@@ -1990,7 +1983,8 @@ class DPEngineCoreProc(EngineCoreProc):
     ) -> None:
         from copy import deepcopy
 
-        from vllm.distributed.elastic_ep.elastic_state import ElasticEPScalingState
+        from vllm.distributed.elastic_ep.elastic_state import \
+            ElasticEPScalingState
 
         new_parallel_config = deepcopy(self.vllm_config.parallel_config)
         old_dp_size = new_parallel_config.data_parallel_size
@@ -2085,7 +2079,8 @@ class DPEngineCoreProc(EngineCoreProc):
         self.eep_scaling_state.handle_notification(notification_type)
 
     def _eep_scale_up_before_kv_init(self):
-        from vllm.distributed.elastic_ep.elastic_state import ElasticEPScalingState
+        from vllm.distributed.elastic_ep.elastic_state import \
+            ElasticEPScalingState
 
         self.eep_scaling_state = ElasticEPScalingState(
             model_executor=self.model_executor,
