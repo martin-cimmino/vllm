@@ -6,7 +6,7 @@
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
 #SBATCH --exclusive
-#SBATCH --time=00:30:00
+#SBATCH --time=08:00:00
 #SBATCH --gres=gpu:1
 #SBATCH --output=smc_results/logs/smc_bench_v5_%j.out
 #SBATCH --error=smc_results/logs/smc_bench_v5_%j.err
@@ -33,12 +33,14 @@ TEMPERATURE=1.0
 MAX_NEW_TOKENS=16384
 SEED=42
 ALPHA_RAMP_TOKENS=100
+OUTPUT_DIR=smc_results
 MAX_PROBLEMS=""
 THINKING="--thinking"
 
 # Parse optional overrides passed after '--'
 while [[ $# -gt 0 ]]; do
     case $1 in
+        --model) MODEL=$2; shift 2;;
         --method) METHOD=$2; shift 2;;
         --n_particles) N_PARTICLES=$2; shift 2;;
         --alpha) ALPHA=$2; shift 2;;
@@ -47,19 +49,29 @@ while [[ $# -gt 0 ]]; do
         --max_new_tokens) MAX_NEW_TOKENS=$2; shift 2;;
         --seed) SEED=$2; shift 2;;
         --alpha_ramp_tokens) ALPHA_RAMP_TOKENS=$2; shift 2;;
+        --output_dir) OUTPUT_DIR=$2; shift 2;;
         --max_problems) MAX_PROBLEMS="--max_problems $2"; shift 2;;
         --thinking) THINKING="--thinking"; shift;;
         *) shift;;
     esac
 done
 
-mkdir -p logs smc_results smc_results/logs "$HF_HOME" "$HF_DATASETS_CACHE"
+mkdir -p logs "$OUTPUT_DIR" "$OUTPUT_DIR/logs" "$HF_HOME" "$HF_DATASETS_CACHE"
+
+# Mirror stdout/stderr into the selected output directory logs.
+# Note: Slurm's #SBATCH --output/--error remain active as the primary capture.
+if [[ -n "${SLURM_JOB_ID:-}" ]]; then
+    exec > >(tee -a "$OUTPUT_DIR/logs/smc_bench_v5_${SLURM_JOB_ID}.out")
+    exec 2> >(tee -a "$OUTPUT_DIR/logs/smc_bench_v5_${SLURM_JOB_ID}.err" >&2)
+fi
 
 echo "========================================================"
 echo "  SMC Benchmark v5 — AIME 2025 Multi-Problem"
+echo "  model=$MODEL"
 echo "  method=$METHOD  n=$N_PARTICLES  α=$ALPHA  τ=$ESS_THRESHOLD"
 echo "  temp=$TEMPERATURE  seed=$SEED  max_new_tokens=$MAX_NEW_TOKENS"
 echo "  alpha_ramp_tokens=$ALPHA_RAMP_TOKENS"
+echo "  output_dir=$OUTPUT_DIR"
 echo "  ${MAX_PROBLEMS:-all 30 problems}"
 echo "========================================================"
 
@@ -75,6 +87,6 @@ python smc_benchmark_v5.py \
     --alpha_ramp_tokens "$ALPHA_RAMP_TOKENS" \
     $MAX_PROBLEMS \
     $THINKING \
-    --output_dir smc_results
+    --output_dir "$OUTPUT_DIR"
 
 echo "Job finished at $(date)"

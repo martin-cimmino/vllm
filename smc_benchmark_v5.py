@@ -76,10 +76,12 @@ def run_baseline(
 
     sp = SamplingParams(
         n=n,
-        temperature=temperature,
         max_tokens=max_tokens,
-        top_p=1.0,
         seed=seed,
+        temperature=1.0,
+        top_p=0.9,
+        min_p=0.1,
+        top_k=25,
     )
 
     t0 = time.time()
@@ -433,12 +435,14 @@ def main():
     method_tag = args.method
     alpha_tag = f"_a{args.alpha}" if run_smc_flag else ""
     tau_tag = f"_tau{args.ess_threshold}" if run_smc_flag else ""
+    ramp_tag = f"_ramp{args.alpha_ramp_tokens}" if run_smc_flag else ""
     out_name = (
         f"smc_benchmark_v5"
         f"_{method_tag}"
         f"{alpha_tag}"
         f"_n{args.n_particles}"
         f"{tau_tag}"
+        f"{ramp_tag}"
         f"_s{args.seed}"
         ".json"
     )

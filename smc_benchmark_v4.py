@@ -426,15 +426,16 @@ def run_one(
 
     sp = SamplingParams(
         n=n_particles,
-        temperature=1.0
-        / alpha,  # proposal temperature (not the same as SMC alpha) optimal proposal: q*(v) ∝ p(v)^α
         smc_alpha=alpha,
         smc_ess_threshold=ess_threshold,
         smc_alpha_ramp_tokens=alpha_ramp_tokens if alpha_ramp_tokens > 0 else None,
         max_tokens=max_tokens,
-        logprobs=0,
-        top_p=1.0,
         seed=seed,
+        logprobs=0,
+        temperature=1.0,  # ignored when using SMC
+        top_p=0.9,
+        min_p=0.1,
+        top_k=25,
     )
 
     print(
